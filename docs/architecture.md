@@ -1,4 +1,4 @@
-# yRDP — a general-purpose, agent-first RDP client
+# yRDP — a general-purpose, agent-first remote-desktop client
 
 ## 1. What it is
 
@@ -66,9 +66,9 @@ Enforced at the point of action, in three places:
 
 - the shadow surface is created at exactly the declared size, so nothing downstream can
   renegotiate it;
-- `+dynamic-resolution` and `/smart-sizing` are never passed to the client — either would
-  hand the far end power to resize the surface under our coordinates. They are named in
-  `FORBIDDEN_CLIENT_FLAGS` and locked out by test, not merely left off;
+- the resize-granting flags of whichever protocol is in use are never passed — RDP's
+  `dynamic-resolution` and `smart-sizing`, VNC's `RemoteResize=1`. Each adapter NAMES its
+  own in `clients.py` and they are locked out by test, not merely left off;
 - a coordinate replayed from another geometry is refused, and a coordinate off the surface
   is refused too, because off-surface is a rotted coordinate rather than a near miss.
 
@@ -98,20 +98,22 @@ Each rung is roughly an order of magnitude dearer and more fragile than the one 
 ## 5. Architecture
 
 ```
-agent (any host)                         human
-   │ yrdp <verb> --target X                 │ yggterm viewport
-   ▼                                        ▼
-shadow surface                          viewport surface  (libyggterm)
-   fixed dimensions, no window             composited like a web surface
-   └── RDP client on a headless display    └── the same session, as a viewer
-          capture: screenshot / crop
-          input:   click / type / key
+agent (any host)                          human (any number of them)
+   │ yrdp <verb> --target X                  │ yrdp view --target X
+   ▼                                         ▼
+        ONE canonical surface — fixed dimensions, pinned by contract
+        └── RDP or VNC client on a headless display
+              capture: screenshot / crop      reveal: shared VNC export
+              input:   click / type / key             + websocket bridge
+                                                      + OSC 7717 web-surface
 ```
 
 - **The agent lane never needs a display of its own**, so unattended operation costs the
   desktop machine nothing.
-- **The viewport lane adds no new substrate**: it is a libyggterm surface alongside the
-  existing ones, not a second window system.
+- **The reveal adds no new substrate and needs no changes to yggterm**: it rides the
+  existing web-surface channel. A native libyggterm surface — the framebuffer composited
+  directly, with no browser and no VNC hop — is the better endgame and is yggterm-side work.
+- **Viewers never evict each other**, and detaching one never touches the session.
 - **Secrets are named, never carried.** A target stores a vault entry NAME; the secret is
   resolved at connect time and handed to the client down an inherited file descriptor, so
   it never appears in argv, the environment, or on disk.
@@ -125,7 +127,8 @@ yrdp state      --target X         does the endpoint answer; is a session live
 yrdp up / down  --target X         run the site's own mechanism, declared as a hook
 yrdp hook       --target X <name>  any other site mechanism, same seam
 yrdp exec       --target X "<cmd>" run a command on the machine hosting the target
-yrdp open       --target X         connect, pin the geometry, PRINT THE LORE
+yrdp open       --target X [--vnc] connect, pin the geometry, PRINT THE LORE
+yrdp view       --target X         reveal that session in the yggterm viewport
 yrdp list / close
 yrdp screenshot --target X [--rect x,y,w,h]        crop first, per the ladder
 yrdp do click   --target X --at 840,412 --proven 1920x1080@1.0
