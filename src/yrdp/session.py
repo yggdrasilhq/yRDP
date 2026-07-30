@@ -1,20 +1,29 @@
-"""RDP sessions — one connection per target, pinned to the declared geometry.
+"""Sessions — one canonical surface per target, pinned to the declared geometry.
 
-There is no daemon in v0, and that is a decision rather than a shortcut: the
-session IS a process pair (a headless X server at exactly the contract geometry,
-and an RDP client inside it), so the operating system already keeps the state a
-daemon would otherwise hold.  What we persist is a small record of that pair, so
-any later invocation — or any other agent on the host — can find, drive and
-close a session it did not open.
+A session is a process pair rather than a daemon's bookkeeping: a headless
+display created at exactly the contract geometry, and a client living inside it.
+The operating system already holds the state a daemon would, so what we persist
+is a small record — which means any later invocation, or any other agent or
+person on the host, can find, drive, reveal and close a session it did not open.
+
+**The canonical surface is never alone.** It exists whether or not anyone is
+watching, and any number of viewers may attach to it and detach again without
+disturbing it (see ``view.py``).  Modelling "agent surface" and "human surface"
+as exclusive modes was a mistake: a surface nobody can look at is a surface
+nobody can trust, and co-browsing one session is the whole point.
 
 The geometry contract is enforced here, at the point of action:
 
-* the X server is created at the target's declared size, so nothing downstream
+* the display is created at the target's declared size, so nothing downstream
   can renegotiate it;
-* ``+dynamic-resolution`` and ``/smart-sizing`` are deliberately NOT passed —
-  either one would let the far end resize the surface under our coordinates;
+* the flags that would let the far end resize us are named per protocol in
+  ``clients.py`` and locked out by test;
 * a coordinate replayed from lore proven at another geometry is refused, and a
   coordinate outside the surface is refused too.
+
+**Viewers scale; they never resize.** That is what makes N-viewer co-browse fall
+out for free: the shared object is a fixed-size framebuffer, not a negotiated
+one.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -30,7 +40,8 @@ from pathlib import Path
 from shutil import which
 from typing import Any
 
-from .config import SURFACE_VIEWPORT, Target, state_dir
+from . import clients
+from .config import ConfigError, Target, state_dir
 from .geometry import Geometry, require_match
 
 CONNECT_TIMEOUT = 45.0
@@ -45,7 +56,7 @@ class CredentialUnavailable(SessionError):
 
     Named separately because the recovery is the operator's, not ours: unlock
     the vault.  Reaching around it — setting a password over an admin channel we
-    happen to hold — would be changing the operator's credential to suit our
+    happen to hold — would be changing someone's credential for our own
     convenience, and is out of bounds.
     """
 
@@ -60,13 +71,17 @@ class Session:
     geometry: str
     display: str
     xvfb_pid: int
-    rdp_pid: int
+    client_pid: int
     host: str
     user: str | None
     opened_at: float
+    protocol: str = "rdp"
     window_found: bool = False
     lease_until: float | None = None
     last_verb: str = "open"
+    #: Attached viewers, appended by view.py.  A session with none is still a
+    #: perfectly good session — it is simply unwatched at this moment.
+    viewers: list[dict] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
 
     @property
@@ -74,7 +89,10 @@ class Session:
         return Geometry.parse(self.geometry)
 
     def alive(self) -> bool:
-        return _alive(self.rdp_pid) and _alive(self.xvfb_pid)
+        return _alive(self.client_pid) and _alive(self.xvfb_pid)
+
+
+# -- the record -------------------------------------------------------------
 
 
 def sessions_dir() -> Path:
@@ -106,11 +124,20 @@ def forget(target: str) -> None:
 
 
 def all_sessions() -> list[Session]:
-    out = []
-    for p in sorted(sessions_dir().glob("*.json")):
-        if s := load(p.stem):
-            out.append(s)
-    return out
+    return [s for p in sorted(sessions_dir().glob("*.json")) if (s := load(p.stem))]
+
+
+def live_session(target: str) -> Session:
+    s = load(target)
+    if s is None:
+        raise SessionError(f"no session for {target}; `yrdp open --target {target}` first")
+    if not s.alive():
+        forget(target)
+        raise SessionError(
+            f"the recorded session for {target} is gone (client or display exited); "
+            f"the record has been cleared, open a new one"
+        )
+    return s
 
 
 def _alive(pid: int) -> bool:
@@ -125,40 +152,50 @@ def _require(binary: str) -> str:
     path = which(binary)
     if path is None:
         raise SessionError(
-            f"{binary} is not installed on this host; the RDP lane needs Xvfb, "
-            f"xfreerdp3 and xdotool"
+            f"{binary} is not installed on this host. yRDP needs Xvfb, xdotool, "
+            f"ImageMagick and a client for the protocol in use."
         )
     return path
 
 
 def _free_display(start: int = 90, end: int = 120) -> str:
-    used = {p.name.lstrip("X") for p in Path("/tmp/.X11-unix").glob("X*")} if Path(
-        "/tmp/.X11-unix"
-    ).is_dir() else set()
+    x11 = Path("/tmp/.X11-unix")
+    used = {p.name.lstrip("X") for p in x11.glob("X*")} if x11.is_dir() else set()
     for n in range(start, end):
         if str(n) not in used and not Path(f"/tmp/.X{n}-lock").exists():
             return f":{n}"
     raise SessionError(f"no free X display between :{start} and :{end}")
 
 
+def reachable(target: Target, timeout: float = 3.0) -> bool:
+    if target.connection is None:
+        raise ConfigError(f"target {target.name!r} declares no [connection] endpoint")
+    try:
+        with socket.create_connection(
+            (target.connection.host, target.connection.port), timeout=timeout
+        ):
+            return True
+    except OSError:
+        return False
+
+
 # -- credentials ------------------------------------------------------------
 
 
 def resolve_password(target: Target, entry: str | None = None) -> str:
-    """Fetch the RDP password by NAME, never by value from config.
+    """Fetch the password by NAME, never by value from config.
 
     Order: an explicit environment override (useful for a one-shot proof), then
     the vault entry the target names.  The vault is the single source of truth
-    for secrets across this fleet; yRDP does not get a second one.
+    for secrets; yRDP does not get a second one.
     """
     if env := os.environ.get("YRDP_RDP_PASSWORD"):
         return env
     name = entry or (target.connection.password_vault_entry if target.connection else None)
     if not name:
         raise CredentialUnavailable(
-            f"target {target.name!r} names no RDP credential. Add "
-            f"password_vault_entry to [connection], or pass --password-entry, "
-            f"or set YRDP_RDP_PASSWORD for a one-shot."
+            f"target {target.name!r} names no credential. Add password_vault_entry to "
+            f"[connection], or pass --password-entry, or set YRDP_RDP_PASSWORD once."
         )
     vault = which("ychrome-vault")
     if vault is None:
@@ -169,63 +206,10 @@ def resolve_password(target: Target, entry: str | None = None) -> str:
         raise CredentialUnavailable(
             f"the vault would not give up {name!r}: {detail}. If it reads locked, the "
             f"operator has to unlock it — agents cannot, by design, and yRDP will not "
-            f"route around that."
+            f"route around that. If it says the entry is unknown, the local agent may "
+            f"simply be behind: `ychrome-vault sync` re-pulls without a password."
         )
     return p.stdout.rstrip("\n")
-
-
-# -- the client command -----------------------------------------------------
-
-#: Flags that would hand the far end the power to resize our surface.  A session
-#: that renegotiates its geometry mid-flight invalidates every coordinate in the
-#: lore without erroring, which is the exact failure the contract exists to
-#: prevent — so they are named here and locked out by test, not merely omitted.
-FORBIDDEN_CLIENT_FLAGS = ("dynamic-resolution", "smart-sizing")
-
-
-def client_argv(target: Target, *, client: str = "xfreerdp3") -> list[str]:
-    """The connection arguments for a target, pinned to its geometry.
-
-    Secret-free by construction.  The password joins this list only inside the
-    file descriptor built by :func:`arg_stream`, so it never reaches the process
-    argv that ``ps`` shows every user on the host.
-    """
-    if target.connection is None:
-        raise SessionError(f"target {target.name!r} declares no [connection] endpoint")
-    geom = target.geometry
-    argv = [
-        client,
-        f"/v:{target.connection.host}:{target.connection.port}",
-        f"/size:{geom.width}x{geom.height}",
-        "/cert:ignore",
-        "/gdi:sw",
-        "/log-level:WARN",
-        "+auto-reconnect",
-    ]
-    if target.connection.user:
-        argv.insert(2, f"/u:{target.connection.user}")
-    if target.connection.domain:
-        argv.insert(2, f"/d:{target.connection.domain}")
-    if target.connection.security:
-        argv.insert(2, f"/sec:{target.connection.security}")
-    return argv
-
-
-def arg_stream(connection_args: list[str], password: str) -> bytes:
-    """The argument list FreeRDP reads from an inherited file descriptor.
-
-    ``/from-stdin`` was the obvious way to keep a password off the command line
-    and it is the wrong one: the client calls ``tcsetattr`` to stop the terminal
-    echoing, that fails on a pipe with "Inappropriate ioctl for device", and the
-    connection dies at "NLA begin failed" — a failure that reads like a broken
-    credential rather than a broken channel.  Proven on the live host.
-
-    ``/args-from:fd:`` has none of that.  The secret crosses one anonymous pipe
-    into the child and exists nowhere else: not in argv, not in the environment,
-    not on disk.  One argument per line, and this option may not be combined
-    with any other, so the whole connection goes through it.
-    """
-    return ("\n".join([*connection_args, f"/p:{password}"]) + "\n").encode()
 
 
 # -- open / close -----------------------------------------------------------
@@ -235,6 +219,7 @@ def open_session(
     target: Target,
     *,
     password_entry: str | None = None,
+    protocol: str | None = None,
     connect_timeout: float = CONNECT_TIMEOUT,
     force: bool = False,
 ) -> Session:
@@ -244,18 +229,11 @@ def open_session(
     if (existing := load(target.name)) and existing.alive() and not force:
         raise SessionError(
             f"{target.name} already has a live session on {existing.display} "
-            f"(pinned {existing.geometry}); close it or pass --force"
+            f"(pinned {existing.geometry}); reveal it with `yrdp view`, or pass --force"
         )
     if existing:
         close_session(target.name, quiet=True)
 
-    if target.surface_mode == SURFACE_VIEWPORT:
-        raise SessionError(
-            f"target {target.name!r} asks for a viewport surface. That lane — the "
-            f"session composited into the yggterm viewport as a libyggterm surface — "
-            f"is designed but NOT BUILT, and yRDP will not quietly hand you a headless "
-            f"shadow instead. Set surface mode to 'shadow' to drive it agentically."
-        )
     if not reachable(target):
         raise SessionError(
             f"{target.connection.host}:{target.connection.port} is not answering. yRDP "
@@ -263,9 +241,11 @@ def open_session(
             f"'up' hook, `yrdp up --target {target.name}` runs it."
         )
 
+    proto = protocol or target.connection.protocol
+    adapter = clients.ADAPTERS[proto]
     password = resolve_password(target, password_entry)
 
-    xvfb, client, xdotool = _require("Xvfb"), _require("xfreerdp3"), _require("xdotool")
+    xvfb, client, xdotool = _require("Xvfb"), _require(adapter.binary), _require("xdotool")
     geom = target.geometry
     display = _free_display()
 
@@ -277,44 +257,32 @@ def open_session(
     _await_display(display, xvfb_proc)
 
     env = {**os.environ, "DISPLAY": display}
-    connection = client_argv(target, client=client)
-
-    read_fd, write_fd = os.pipe()
-    os.write(write_fd, arg_stream(connection[1:], password))
-    os.close(write_fd)
-    try:
-        rdp_proc = subprocess.Popen(
-            [client, f"/args-from:fd:{read_fd}"],
-            env=env,
-            pass_fds=(read_fd,),
-            # No stdin at all: the client must never be able to sit at a prompt
-            # waiting for a credential we have already given it.
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    finally:
-        os.close(read_fd)
+    spawned = clients.spawn(target, password, env, protocol=proto, binary=client)
+    spawned.release()
+    client_proc = spawned.proc
 
     session = Session(
         target=target.name,
         geometry=geom.stamp,
         display=display,
         xvfb_pid=xvfb_proc.pid,
-        rdp_pid=rdp_proc.pid,
+        client_pid=client_proc.pid,
         host=f"{target.connection.host}:{target.connection.port}",
         user=target.connection.user,
         opened_at=time.time(),
+        protocol=proto,
     )
 
     try:
-        session.window_found = _await_window(display, xdotool, rdp_proc, connect_timeout, session)
+        session.window_found = _await_window(
+            display, xdotool, client_proc, connect_timeout, session, adapter
+        )
     except BaseException:
-        # A session that failed to open must not leave a headless X server and a
-        # half-connected client behind. They would hold a display number, show up
+        # A session that failed to open must not leave a headless display and a
+        # half-connected client behind: they would hold a display number, appear
         # in nobody's session list, and be found later by whoever wonders what is
         # eating the host.
-        _reap(rdp_proc, xvfb_proc)
+        _reap(client_proc, xvfb_proc)
         raise
     save(session)
     return session
@@ -344,14 +312,8 @@ def _await_display(display: str, proc: subprocess.Popen, timeout: float = 15.0) 
     raise SessionError(f"Xvfb never created {display}")
 
 
-#: Every FreeRDP connection failure is reported with one of these prefixes.  We
-#: watch for it in the client's stderr AS IT RUNS, because a client that has
-#: already been told "no" may still be sitting there alive.
-FATAL_MARKER = "ERRCONNECT_"
-
-
 def _drain(stream, buf: list[str]) -> str:
-    """Read whatever the client has said so far without blocking on it.
+    """Read what the client has said so far without blocking on it.
 
     Draining also keeps the pipe from filling: a client we never read from can
     block on its own stderr and then look like a hang we caused.
@@ -367,7 +329,12 @@ def _drain(stream, buf: list[str]) -> str:
 
 
 def _await_window(
-    display: str, xdotool: str, proc: subprocess.Popen, timeout: float, session: Session
+    display: str,
+    xdotool: str,
+    proc: subprocess.Popen,
+    timeout: float,
+    session: Session,
+    adapter: clients.Adapter,
 ) -> bool:
     """Wait for the client to paint, or for it to tell us why it will not."""
     deadline = time.monotonic() + timeout
@@ -375,15 +342,12 @@ def _await_window(
     while time.monotonic() < deadline:
         text = _drain(proc.stderr, buf)
         if (code := proc.poll()) is not None:
-            raise _classify(code, text + (proc.stderr.read() or b"").decode(errors="replace"))
-        if FATAL_MARKER in text:
-            # It answered; do not make the caller wait out the timeout for it.
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:  # pragma: no cover
-                proc.kill()
-            raise _classify(proc.returncode or -1, text)
+            raise _classify(code, text + (proc.stderr.read() or b"").decode(errors="replace"), adapter)
+        if adapter.fatal_marker and adapter.fatal_marker in text:
+            # It answered. Do not make the caller wait out the timeout for a
+            # verdict already given.
+            _reap(proc)
+            raise _classify(proc.returncode or -1, text, adapter)
         found = subprocess.run(
             [xdotool, "search", "--onlyvisible", "--class", "."],
             env={**os.environ, "DISPLAY": display},
@@ -391,7 +355,6 @@ def _await_window(
             text=True,
         )
         if found.returncode == 0 and found.stdout.strip():
-            session.events.append(f"window mapped after {time.monotonic() - deadline + timeout:.1f}s")
             return True
         time.sleep(0.5)
     # A live client with no mapped window is not a failure we should invent a
@@ -400,24 +363,20 @@ def _await_window(
     return False
 
 
-def _classify(code: int, stderr: str) -> SessionError:
-    if "LOGON_FAILURE" in stderr or "ERRCONNECT_LOGON_FAILURE" in stderr:
+def _classify(code: int, stderr: str, adapter: clients.Adapter) -> SessionError:
+    """Same named outcomes for every protocol — the caller's recovery differs."""
+    if any(m in stderr for m in adapter.auth_markers):
         return AuthRefused(
-            "the guest refused the credential (NLA logon failure). The RDP service is "
-            "healthy — this is the password, not the plumbing."
+            "the far end refused the credential. The service is healthy — this is the "
+            "password, not the plumbing."
         )
-    if "ACCOUNT_DISABLED" in stderr or "ACCOUNT_RESTRICTION" in stderr:
-        return AuthRefused(
-            "the account is disabled or restricted for network logon. A blank password "
-            "is refused for RDP by default policy even when console logon allows it."
-        )
-    if "ERRCONNECT_CONNECT_FAILED" in stderr or "ERRCONNECT_CONNECT_TRANSPORT_FAILED" in stderr:
+    if any(m in stderr for m in adapter.unreachable_markers):
         return SessionError(
-            "could not reach the RDP service. On this substrate that means the VM is "
-            "not running — check `yrdp vm state`."
+            "could not reach the service. yRDP does not guess why; if this target has an "
+            "'up' hook, the machine may simply not be running."
         )
     tail = "\n".join(line for line in stderr.splitlines() if "ERROR" in line)[-600:]
-    return SessionError(f"the RDP client exited with {code}: {tail or stderr[-400:]}")
+    return SessionError(f"the client exited with {code}: {tail or stderr[-400:]}")
 
 
 def close_session(target: str, *, quiet: bool = False) -> bool:
@@ -426,38 +385,30 @@ def close_session(target: str, *, quiet: bool = False) -> bool:
         if quiet:
             return False
         raise SessionError(f"no recorded session for {target}")
-    for pid in (s.rdp_pid, s.xvfb_pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+    # Viewers first: a viewer outliving its session would keep serving a frozen
+    # frame, which is worse than no picture at all.
+    for viewer in s.viewers:
+        for pid in viewer.get("pids", []):
+            _kill(pid)
+    for pid in (s.client_pid, s.xvfb_pid):
+        _kill(pid)
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and (_alive(s.rdp_pid) or _alive(s.xvfb_pid)):
+    while time.monotonic() < deadline and (_alive(s.client_pid) or _alive(s.xvfb_pid)):
         time.sleep(0.2)
-    for pid in (s.rdp_pid, s.xvfb_pid):
-        if _alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+    for pid in (s.client_pid, s.xvfb_pid):
+        _kill(pid, signal.SIGKILL)
     forget(target)
     return True
 
 
+def _kill(pid: int, sig: int = signal.SIGTERM) -> None:
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError, TypeError):
+        pass
+
+
 # -- driving ----------------------------------------------------------------
-
-
-def live_session(target: str) -> Session:
-    s = load(target)
-    if s is None:
-        raise SessionError(f"no session for {target}; `yrdp ctl open --target {target}` first")
-    if not s.alive():
-        forget(target)
-        raise SessionError(
-            f"the recorded session for {target} is gone (client or X server exited); "
-            f"the record has been cleared, open a new one"
-        )
-    return s
 
 
 def _xdo(s: Session, *args: str, timeout: float = 20.0) -> str:
@@ -533,4 +484,5 @@ def describe(s: Session) -> dict[str, Any]:
         **asdict(s),
         "alive": s.alive(),
         "age_s": round(time.time() - s.opened_at, 1),
+        "viewer_count": len([v for v in s.viewers if _alive((v.get("pids") or [0])[0])]),
     }

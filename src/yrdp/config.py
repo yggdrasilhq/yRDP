@@ -20,11 +20,17 @@ baked into this repo is also a fact leaking out of a private one.  So:
 Shape of a target file:
 
     [target]      name, kind, description
-    [connection]  host, port, user, domain, security, password_vault_entry
+    [connection]  protocol, host, port, user, domain, security, password_vault_entry
     [geometry]    width, height, scale        -- THE CONTRACT (see geometry.py)
-    [surface]     mode = "shadow" | "viewport"
-    [host]        ssh = [...]                 -- a shell on the hosting machine
+    [host]        shell = [...]               -- a shell on the hosting machine
     [hooks]       <name> = [...]              -- site-specific commands, as data
+
+There is deliberately no "surface mode".  A session has ONE canonical surface,
+pinned at the contract geometry; a viewport is a REVEAL of that same session that
+any number of viewers may attach to and detach from without disturbing it.  They
+were modelled as exclusive modes once, which was wrong: it left the agent's
+surface unwatchable, and a surface nobody can look at is a surface nobody can
+trust.
 """
 
 from __future__ import annotations
@@ -43,12 +49,15 @@ STATE_DIR_ENV = "YRDP_STATE_DIR"
 #: namespace because yRDP is a surface of that system, not a separate install.
 DEFAULT_STATE_DIR = Path.home() / ".yggterm" / "yrdp"
 
-#: A fixed-dimension surface the agent drives, with no window on any screen.
-#: The dimensions are the contract, which is what makes lore replayable.
-SURFACE_SHADOW = "shadow"
-#: A libyggterm surface in the yggterm viewport — the human lane.
-SURFACE_VIEWPORT = "viewport"
-SURFACE_MODES = (SURFACE_SHADOW, SURFACE_VIEWPORT)
+#: Protocols this client speaks.  One tool, not two: everything above the client
+#: adapter — the geometry contract, sessions, viewers, lore, hooks, credentials —
+#: is protocol-independent, so a second codebase would only be a second copy that
+#: drifts.  ``--vnc`` on the command line overrides the target's declaration.
+PROTOCOL_RDP = "rdp"
+PROTOCOL_VNC = "vnc"
+PROTOCOLS = (PROTOCOL_RDP, PROTOCOL_VNC)
+
+DEFAULT_PORT = {PROTOCOL_RDP: 3389, PROTOCOL_VNC: 5900}
 
 
 class ConfigError(Exception):
@@ -58,6 +67,7 @@ class ConfigError(Exception):
 @dataclass(frozen=True, slots=True)
 class Connection:
     host: str
+    protocol: str = PROTOCOL_RDP
     port: int = 3389
     user: str | None = None
     domain: str | None = None
@@ -73,7 +83,6 @@ class Target:
     kind: str = "rdp"
     description: str = ""
     connection: Connection | None = None
-    surface_mode: str = SURFACE_SHADOW
     #: argv prefix that runs a command on the machine hosting the target.
     #: Whatever gets a shell there — ssh, a container attach, anything.
     host_shell: tuple[str, ...] = ()
@@ -147,10 +156,16 @@ def from_toml(name: str, raw: dict, path: Path | None = None) -> Target:
 
     connection = None
     if c := (raw.get("connection") or {}):
+        protocol = str(c.get("protocol", PROTOCOL_RDP)).lower()
+        if protocol not in PROTOCOLS:
+            raise ConfigError(
+                f"{path or name}: protocol {protocol!r} is not one of {PROTOCOLS}"
+            )
         try:
             connection = Connection(
                 host=str(c["host"]),
-                port=int(c.get("port", 3389)),
+                protocol=protocol,
+                port=int(c.get("port", DEFAULT_PORT[protocol])),
                 user=c.get("user"),
                 domain=c.get("domain"),
                 security=c.get("security"),
@@ -158,12 +173,6 @@ def from_toml(name: str, raw: dict, path: Path | None = None) -> Target:
             )
         except KeyError as exc:
             raise ConfigError(f"{path or name}: [connection] needs a host") from exc
-
-    surface = str((raw.get("surface") or {}).get("mode", SURFACE_SHADOW))
-    if surface not in SURFACE_MODES:
-        raise ConfigError(
-            f"{path or name}: surface mode {surface!r} is not one of {SURFACE_MODES}"
-        )
 
     hooks = {
         str(k): tuple(str(x) for x in v)
@@ -177,7 +186,6 @@ def from_toml(name: str, raw: dict, path: Path | None = None) -> Target:
         description=str(t.get("description", "")),
         geometry=geometry,
         connection=connection,
-        surface_mode=surface,
         host_shell=tuple(str(x) for x in (raw.get("host") or {}).get("shell", ())),
         hooks=hooks,
         source=path,

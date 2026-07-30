@@ -27,7 +27,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import lore, session, substrate
+from . import lore, session, substrate, view
+from . import config as config_mod
 from .config import ConfigError, Target, list_targets, load_target, targets_dir
 from .geometry import GeometryMismatch
 
@@ -66,7 +67,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             "kind": t.kind,
             "description": t.description,
             "geometry": t.geometry.stamp,
-            "surface_mode": t.surface_mode,
+            "protocol": conn.protocol if conn else None,
             "endpoint": f"{conn.host}:{conn.port}" if conn else None,
             "user": conn.user if conn else None,
             "credential_entry": conn.password_vault_entry if conn else None,
@@ -74,7 +75,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             "hooks": sorted(t.hooks),
             "source": str(t.source),
         },
-        f"{t.name}: {t.surface_mode} surface pinned at {t.geometry.stamp}",
+        f"{t.name}: {conn.protocol if conn else 'no'} target pinned at {t.geometry.stamp}",
     )
 
 
@@ -95,7 +96,7 @@ def cmd_state(args: argparse.Namespace) -> int:
         target=t.name,
         endpoint=f"{conn.host}:{conn.port}" if conn else "",
         state=substrate.REACHABLE if substrate.reachable(t) else substrate.UNREACHABLE,
-        surface_mode=t.surface_mode,
+        protocol=conn.protocol if conn else "",
         geometry=t.geometry.stamp,
         session=session.describe(live) if live else None,
         hook=hook_result,
@@ -143,20 +144,29 @@ def cmd_exec(args: argparse.Namespace) -> int:
     return _emit(result, f"{t.name}: exit {result['returncode']}")
 
 
+def _protocol(args: argparse.Namespace) -> str | None:
+    """--vnc overrides the target's declaration; there is one tool, not two."""
+    return config_mod.PROTOCOL_VNC if getattr(args, "vnc", False) else None
+
+
 # -- sessions ---------------------------------------------------------------
 
 
 def cmd_open(args: argparse.Namespace) -> int:
     t = _target(args)
     s = session.open_session(
-        t, password_entry=args.password_entry, connect_timeout=args.timeout, force=args.force
+        t,
+        password_entry=args.password_entry,
+        protocol=_protocol(args),
+        connect_timeout=args.timeout,
+        force=args.force,
     )
     # Recall is not a flag and not optional: a skill an agent must remember to
     # load is a skill an agent forgets, so opening a session prints the lore.
     lore.recall(t.name)
     return _emit(
         session.describe(s),
-        f"{t.name}: {t.surface_mode} surface on {s.display} pinned at {s.geometry}"
+        f"{t.name}: {s.protocol} surface on {s.display} pinned at {s.geometry}"
         + ("" if s.window_found else " (client alive, nothing mapped yet — screenshot it)"),
     )
 
@@ -203,6 +213,45 @@ def cmd_do(args: argparse.Namespace) -> int:
         session.key(s, args.text or "")
         did = f"key {args.text}"
     return _emit({"target": args.target, "did": did, "geometry": s.geometry}, f"{args.target}: {did}")
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    """Reveal a live session in the yggterm viewport, and hold it there.
+
+    The session is NOT created for the view and NOT destroyed with it: a viewer
+    attaches to whatever is already running, and detaching leaves it running.
+    Several viewers may watch at once — that is co-browse, and it is the point.
+    """
+    t = _target(args)
+    s = session.load(args.target)
+    if s is None or not s.alive():
+        if args.no_open:
+            raise SystemExit(
+                f"[{PROG}] no live session for {args.target} and --no-open was given"
+            )
+        s = session.open_session(
+            t, password_entry=args.password_entry, protocol=_protocol(args), force=True
+        )
+        lore.recall(t.name)
+    if not view.in_yggterm():
+        print(
+            f"[{PROG}] warning: no YGGTERM_SESSION_ID in this environment, so nothing "
+            f"will consume the surface announcement. The URL below still works in any "
+            f"browser that can reach this host's loopback.",
+            file=sys.stderr,
+        )
+    viewer = view.attach(s, read_only=args.read_only, title=args.title)
+    print(
+        f"[{PROG}] {args.target}: revealed at {s.geometry} on {s.display} "
+        f"({'read-only' if args.read_only else 'interactive'}) — {viewer.url}",
+        file=sys.stderr,
+    )
+    if args.once:
+        return _emit(viewer.as_dict(), f"{args.target}: surface announced once, not held")
+    print(f"[{PROG}] holding the surface; Ctrl-C detaches (the session keeps running)",
+          file=sys.stderr)
+    view.hold(s, viewer)
+    return 0
 
 
 def cmd_lore(args: argparse.Namespace) -> int:
@@ -253,7 +302,17 @@ def build_parser() -> argparse.ArgumentParser:
     op.add_argument("--password-entry", help="vault entry NAME holding the password")
     op.add_argument("--timeout", type=float, default=session.CONNECT_TIMEOUT)
     op.add_argument("--force", action="store_true")
+    op.add_argument("--vnc", action="store_true", help="speak VNC instead of the target's protocol")
     op.set_defaults(func=cmd_open)
+
+    vw = wt(sub.add_parser("view", help="reveal a live session in the yggterm viewport"))
+    vw.add_argument("--read-only", action="store_true", help="watch without being able to act")
+    vw.add_argument("--title", help="surface title shown by yggterm")
+    vw.add_argument("--once", action="store_true", help="announce and exit instead of holding")
+    vw.add_argument("--no-open", action="store_true", help="fail if no session is already live")
+    vw.add_argument("--password-entry", help="vault entry NAME, if a session must be opened")
+    vw.add_argument("--vnc", action="store_true")
+    vw.set_defaults(func=cmd_view)
     sub.add_parser("list", help="every recorded session").set_defaults(func=cmd_list)
     wt(sub.add_parser("close", help="end a session")).set_defaults(func=cmd_close)
 
@@ -287,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         ConfigError,
         substrate.HookError,
         session.SessionError,
+        view.ViewError,
         GeometryMismatch,
     ) as exc:
         # The tool's own refusals and diagnoses, not tracebacks: they are meant

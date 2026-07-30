@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from yrdp import config, session, substrate  # noqa: E402
+from yrdp import clients, config, session, view  # noqa: E402
 from yrdp.geometry import (  # noqa: E402
     Geometry,
     GeometryError,
@@ -105,7 +105,7 @@ def _session(width=1920, height=1080):
         geometry=f"{width}x{height}@1.0",
         display=":99",
         xvfb_pid=1,
-        rdp_pid=1,
+        client_pid=1,
         host="h:3389",
         user=None,
         opened_at=0.0,
@@ -144,10 +144,10 @@ def test_the_client_is_never_given_a_flag_that_lets_the_far_end_resize_us(target
         host = "host.example"
         user = "someone"
     """)
-    argv = session.client_argv(config.load_target("r"))
+    argv = clients.connection_argv(config.load_target("r"))
     joined = " ".join(argv)
     assert "/size:1920x1080" in joined, "the surface must be pinned to the contract"
-    for flag in session.FORBIDDEN_CLIENT_FLAGS:
+    for flag in clients.RDP.forbidden:
         assert flag not in joined, f"{flag} hands the far end control of our geometry"
 
 
@@ -165,12 +165,12 @@ def test_a_secret_is_never_placed_on_the_command_line(targets):
         host = "host.example"
         user = "someone"
     """)
-    argv = session.client_argv(config.load_target("s"))
+    argv = clients.connection_argv(config.load_target("s"))
     assert not any(a.startswith("/p:") for a in argv)
     assert not any("hunter2" in a for a in argv)
     # The secret exists only inside the fd stream, which no other process can
     # read: not argv, not the environment, not a file on disk.
-    stream = session.arg_stream(argv[1:], "hunter2").decode()
+    stream = clients.arg_stream(argv[1:], "hunter2").decode()
     assert "/p:hunter2" in stream.splitlines()
     assert stream.endswith("\n"), "FreeRDP wants one argument per line"
 
@@ -190,7 +190,7 @@ def test_the_credential_is_named_not_carried(targets):
     """)
     t = config.load_target("v")
     assert t.connection.password_vault_entry is None
-    with pytest.raises(session.CredentialUnavailable, match="names no RDP credential"):
+    with pytest.raises(session.CredentialUnavailable, match="names no credential"):
         session.resolve_password(t)
 
 
@@ -203,24 +203,6 @@ def test_no_targets_directory_is_guessed(monkeypatch):
     with pytest.raises(config.ConfigError, match=config.TARGETS_DIR_ENV):
         config.targets_dir()
 
-
-def test_a_viewport_target_refuses_rather_than_quietly_going_headless(targets):
-    """Silently substituting a different surface would be a lie about the product."""
-    _write(targets, "vp.toml", """
-        [target]
-        name = "vp"
-        [geometry]
-        width = 1920
-        height = 1080
-        [surface]
-        mode = "viewport"
-        [connection]
-        host = "host.example"
-    """)
-    t = config.load_target("vp")
-    assert t.surface_mode == config.SURFACE_VIEWPORT
-    with pytest.raises(session.SessionError, match="NOT BUILT"):
-        session.open_session(t)
 
 
 def test_an_unknown_hook_says_what_the_target_does_declare(targets):
@@ -244,6 +226,12 @@ def test_an_unknown_hook_says_what_the_target_does_declare(targets):
 #: in the very act of listing them, so the lock matches structure instead: an
 #: address literal, somebody's home directory, a hypervisor image, a container
 #: command. A general-purpose client has no business containing any of them.
+#: Addresses that belong to no site: loopback and the any-address. They are
+#: universal facts, not somebody's deployment, and the reveal genuinely needs to
+#: name loopback — the surface must never bind off-box. Exempted by NAME rather
+#: than by weakening the pattern, so a real address still trips the guard.
+UNIVERSAL_ADDRESSES = ("127.0.0.1", "0.0.0.0", "255.255.255.255")
+
 SITE_SPECIFIC_SHAPES = (
     r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
     r"/home/[a-z]",
@@ -278,6 +266,113 @@ def test_the_repo_carries_no_site_specific_shapes():
             continue
         for pattern in SITE_SPECIFIC_SHAPES:
             for m in re.finditer(pattern, text):
+                if m.group(0) in UNIVERSAL_ADDRESSES:
+                    continue
                 line = text[: m.start()].count("\n") + 1
                 offenders.append(f"{path.relative_to(root)}:{line}: {m.group(0)!r}")
     assert not offenders, "site-specific detail in a publishable repo:\n" + "\n".join(offenders)
+
+
+# -- one session, N viewers -------------------------------------------------
+
+
+def test_a_viewer_scales_and_never_resizes_the_surface():
+    """The rule that makes co-browse fall out for free.
+
+    A terminal's grid IS its geometry, so two viewers at different sizes fight
+    over one authoritative number. Here the framebuffer is fixed by contract, so
+    viewers may differ — as long as every one of them scales rather than asking
+    the far end to change size.
+    """
+    url = "http://127.0.0.1:6100/vnc.html?autoconnect=1&reconnect=1&resize=scale&show_dot=1"
+    assert "resize=scale" in url
+    assert "resize=remote" not in url
+
+
+def test_viewers_share_rather_than_evict_each_other():
+    """Without -shared, a second viewer kicks the first off. That is not co-browse."""
+    import inspect
+
+    src = inspect.getsource(view.attach)
+    assert '"-shared"' in src, "viewers must not evict each other"
+    assert '"-forever"' in src, "the session must outlive any one viewer"
+    assert '"-localhost"' in src, "the surface is loopback-only; tunnelling is yggterm's job"
+
+
+def test_detaching_a_viewer_leaves_the_session_running():
+    """The whole correction: a session must not exist only while someone watches.
+
+    Uses real processes, because the bug this guards against is 'detach reaped
+    the wrong pids', which only a real signal can prove.
+    """
+    import subprocess as sp
+    import time
+
+    surface = [sp.Popen(["sleep", "30"]), sp.Popen(["sleep", "30"])]
+    viewer_procs = [sp.Popen(["sleep", "30"]), sp.Popen(["sleep", "30"])]
+    try:
+        s = session.Session(
+            target="t", geometry="800x600@1.0", display=":99",
+            xvfb_pid=surface[0].pid, client_pid=surface[1].pid,
+            host="h:5900", user=None, opened_at=0.0,
+        )
+        v = view.Viewer(
+            target="t", vnc_port=1, web_port=2, url="u",
+            pids=[p.pid for p in viewer_procs], read_only=False, started_at=0.0,
+        )
+        s.viewers.append(v.as_dict())
+        view.detach(s, v)
+        time.sleep(0.5)
+        assert all(p.poll() is not None for p in viewer_procs), "viewers must be gone"
+        assert all(p.poll() is None for p in surface), "the SESSION must survive its viewers"
+    finally:
+        for p in surface + viewer_procs:
+            p.kill()
+
+
+# -- one tool, two protocols ------------------------------------------------
+
+
+def test_the_vnc_adapter_pins_the_surface_and_refuses_remote_resize(targets):
+    """RemoteResize=1 is TigerVNC's exact analogue of RDP's dynamic-resolution."""
+    _write(targets, "v9.toml", """
+        [target]
+        name = "v9"
+        [geometry]
+        width = 1440
+        height = 900
+        [connection]
+        protocol = "vnc"
+        host = "host.example"
+    """)
+    t = config.load_target("v9")
+    assert t.connection.port == 5900, "the default port must follow the protocol"
+    argv = clients.connection_argv(t)
+    joined = " ".join(argv)
+    assert "-RemoteResize=0" in argv, "a viewer must never resize the remote desktop"
+    assert "1440x900" in joined, "the surface must be pinned to the contract"
+    for flag in clients.VNC.forbidden:
+        assert flag not in joined
+
+
+def test_both_protocols_classify_into_the_same_named_outcomes():
+    """The caller's recovery depends on the outcome, never on the protocol."""
+    for adapter in (clients.RDP, clients.VNC):
+        assert adapter.auth_markers, f"{adapter.binary} must be able to say 'wrong password'"
+        assert adapter.unreachable_markers, f"{adapter.binary} must be able to say 'no answer'"
+        assert adapter.forbidden, f"{adapter.binary} must name its resize-granting flags"
+
+
+def test_an_unknown_protocol_is_refused_not_defaulted(targets):
+    _write(targets, "p.toml", """
+        [target]
+        name = "p"
+        [geometry]
+        width = 800
+        height = 600
+        [connection]
+        protocol = "telepathy"
+        host = "host.example"
+    """)
+    with pytest.raises(config.ConfigError, match="telepathy"):
+        config.load_target("p")

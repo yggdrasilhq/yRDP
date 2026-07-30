@@ -59,7 +59,7 @@ class State:
     target: str
     endpoint: str
     state: str
-    surface_mode: str
+    protocol: str
     geometry: str
     session: dict[str, Any] | None = None
     hook: dict[str, Any] | None = None
@@ -70,7 +70,7 @@ class State:
             "target": self.target,
             "endpoint": self.endpoint,
             "state": self.state,
-            "surface_mode": self.surface_mode,
+            "protocol": self.protocol,
             "geometry": self.geometry,
             "session": self.session,
             "hook": self.hook,
