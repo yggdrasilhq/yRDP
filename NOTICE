@@ -1,0 +1,9 @@
+Copyright 2026 Avikalpa Kundu
+
+yRDP — a general-purpose, agent-first remote-desktop client.
+
+Source code is licensed under GPL-3.0-or-later. Markdown documentation and
+skills are licensed separately under CC BY-SA 4.0. See the LICENSE files.
+
+yRDP ships no targets and guesses no paths: every site-specific fact —
+addresses, hypervisor commands, targets, lore — lives outside this repository.

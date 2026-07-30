@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# yRDP entry point.  No install step on purpose: the tool is a git checkout that
+# `git pull` updates, exactly like the lore it reads.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$here/../src${PYTHONPATH:+:$PYTHONPATH}"
+exec "${YRDP_PYTHON:-python3}" -m yrdp.cli "$@"
