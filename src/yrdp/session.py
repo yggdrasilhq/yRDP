@@ -182,7 +182,9 @@ def reachable(target: Target, timeout: float = 3.0) -> bool:
 # -- credentials ------------------------------------------------------------
 
 
-def resolve_password(target: Target, entry: str | None = None) -> str:
+def resolve_password(
+    target: Target, entry: str | None = None, *, required: bool = True
+) -> str | None:
     """Fetch the password by NAME, never by value from config.
 
     Order: an explicit environment override (useful for a one-shot proof), then
@@ -193,6 +195,12 @@ def resolve_password(target: Target, entry: str | None = None) -> str:
         return env
     name = entry or (target.connection.password_vault_entry if target.connection else None)
     if not name:
+        if not required:
+            # Naming no credential is a legitimate answer for an endpoint that
+            # asks for none. Refusing here would invent a requirement the far
+            # end does not have; if it does want one, its own refusal says so
+            # clearly and this returns AuthRefused instead.
+            return None
         raise CredentialUnavailable(
             f"target {target.name!r} names no credential. Add password_vault_entry to "
             f"[connection], or pass --password-entry, or set YRDP_RDP_PASSWORD once."
@@ -243,7 +251,7 @@ def open_session(
 
     proto = protocol or target.connection.protocol
     adapter = clients.ADAPTERS[proto]
-    password = resolve_password(target, password_entry)
+    password = resolve_password(target, password_entry, required=adapter.credential_required)
 
     xvfb, client, xdotool = _require("Xvfb"), _require(adapter.binary), _require("xdotool")
     geom = target.geometry

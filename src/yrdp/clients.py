@@ -60,6 +60,12 @@ class Adapter:
     #: A marker whose appearance means the attempt is over, so a caller need not
     #: wait out its whole connect timeout for an answer already given.
     fatal_marker: str = ""
+    #: Whether a credential is required to connect at all.  RDP effectively
+    #: always needs one, so a target that names none is a configuration mistake
+    #: worth refusing early.  A VNC endpoint may legitimately offer no
+    #: authentication — a hypervisor console on loopback is the common case —
+    #: and refusing to connect to one would be inventing a requirement.
+    credential_required: bool = True
 
 
 RDP = Adapter(
@@ -79,6 +85,7 @@ VNC = Adapter(
     auth_markers=("Authentication failure", "authentication failed", "Too many auth"),
     unreachable_markers=("unable to connect", "Connection refused", "No route to host"),
     fatal_marker="",
+    credential_required=False,
 )
 
 ADAPTERS = {PROTOCOL_RDP: RDP, PROTOCOL_VNC: VNC}
@@ -131,7 +138,6 @@ def connection_argv(target: Target, *, protocol: str | None = None, binary: str 
         "-Shared=1",
         "-AlertOnFatalError=0",
         "-ReconnectOnError=0",
-        "-autopass",
     ]
 
 
@@ -149,7 +155,7 @@ def arg_stream(connection_args: list[str], password: str) -> bytes:
 
 def spawn(
     target: Target,
-    password: str,
+    password: str | None,
     env: dict[str, str],
     *,
     protocol: str | None = None,
@@ -162,6 +168,8 @@ def spawn(
     exe = binary or ADAPTERS[proto].binary
 
     if proto == PROTOCOL_RDP:
+        if password is None:
+            raise ValueError("RDP needs a credential; none was resolved")
         # The whole invocation crosses one anonymous pipe as an inherited fd, so
         # the secret exists nowhere else: not argv, not the environment, not disk.
         read_fd, write_fd = os.pipe()
@@ -180,7 +188,11 @@ def spawn(
         return Spawned(proc, (read_fd,))
 
     # TigerVNC's -autopass reads one password line from stdin, which is the same
-    # guarantee by a different door.
+    # guarantee by a different door. Only ask for it when we actually have one:
+    # a server offering no authentication would be handed a password it never
+    # requested, and the handshake fails in a way that reads like a bad secret.
+    if password is not None:
+        argv.append("-autopass")
     proc = subprocess.Popen(
         argv,
         env=env,
@@ -189,8 +201,9 @@ def spawn(
         stderr=subprocess.PIPE,
     )
     try:
-        proc.stdin.write((password + "\n").encode())
-        proc.stdin.flush()
+        if password is not None:
+            proc.stdin.write((password + "\n").encode())
+            proc.stdin.flush()
     except (BrokenPipeError, OSError):  # pragma: no cover
         pass
     finally:

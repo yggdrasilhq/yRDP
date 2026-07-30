@@ -223,8 +223,23 @@ def cmd_view(args: argparse.Namespace) -> int:
     Several viewers may watch at once — that is co-browse, and it is the point.
     """
     t = _target(args)
+    conn = t.connection
+    direct = None
     s = session.load(args.target)
-    if s is None or not s.alive():
+    if s is not None and not s.alive():
+        s = None
+    if s is None and conn is not None and conn.protocol == config_mod.PROTOCOL_VNC:
+        # A VNC endpoint is already a framebuffer protocol, so a reveal needs
+        # nothing standing in front of it — no session, no X export, no viewer.
+        # Bridging it straight through is fewer moving parts, not a shortcut.
+        direct = (conn.host, conn.port)
+        if not session.reachable(t):
+            raise SystemExit(
+                f"[{PROG}] {conn.host}:{conn.port} is not answering; "
+                f"`yrdp up --target {t.name}` runs this target's own 'up' hook"
+            )
+        lore.recall(t.name)
+    elif s is None:
         if args.no_open:
             raise SystemExit(
                 f"[{PROG}] no live session for {args.target} and --no-open was given"
@@ -240,9 +255,12 @@ def cmd_view(args: argparse.Namespace) -> int:
             f"browser that can reach this host's loopback.",
             file=sys.stderr,
         )
-    viewer = view.attach(s, read_only=args.read_only, title=args.title)
+    viewer = view.attach(
+        s, read_only=args.read_only, title=args.title, endpoint=direct, label=t.name
+    )
+    where = f"on {s.display}" if s else f"straight from {direct[0]}:{direct[1]}"
     print(
-        f"[{PROG}] {args.target}: revealed at {s.geometry} on {s.display} "
+        f"[{PROG}] {args.target}: revealed at {t.geometry.stamp} {where} "
         f"({'read-only' if args.read_only else 'interactive'}) — {viewer.url}",
         file=sys.stderr,
     )

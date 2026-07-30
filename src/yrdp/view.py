@@ -119,44 +119,69 @@ def in_yggterm() -> bool:
 
 
 def attach(
-    s: Session,
+    s: Session | None,
     *,
     read_only: bool = False,
     title: str | None = None,
+    endpoint: tuple[str, int] | None = None,
+    label: str = "",
 ) -> Viewer:
-    """Export the session's surface and announce it, without disturbing it."""
-    x11vnc = which("x11vnc")
+    """Reveal a surface and announce it, without disturbing what is behind it.
+
+    Two shapes, and the difference is worth stating because it removes work
+    rather than adding it:
+
+    * an **RDP session** has no framebuffer anyone else can read, so we export
+      the pinned display over VNC and bridge that;
+    * a **VNC endpoint is already a framebuffer protocol**, so there is nothing
+      to export — the bridge points straight at it. No X server, no viewer, no
+      window manager in the path, and one less thing to go wrong.
+    """
     websockify = which("websockify")
-    if not x11vnc or not websockify:
+    if not websockify:
         raise ViewError(
-            "the reveal needs x11vnc and websockify on this host; install them, or use "
+            "the reveal needs websockify on this host; install it, or use "
             "`yrdp screenshot` for a still frame"
         )
     root = _novnc_root()
-    vnc_port, web_port = _free_port(), _free_port(6100, 6200)
+    web_port = _free_port(6100, 6200)
+    pids: list[int] = []
 
-    argv = [
-        x11vnc,
-        "-display", s.display,
-        "-rfbport", str(vnc_port),
-        "-localhost",          # never off-box; the tunnel is yggterm's job
-        "-nopw",               # loopback-only, and the surface is already gated
-        "-shared",             # THE co-browse flag: viewers do not evict each other
-        "-forever",            # the session outlives any one viewer
-        "-noxdamage",
-    ]
-    if read_only:
-        argv.append("-viewonly")
-    env = _clean_env(s.display)
-    vnc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    _await_port(vnc_port, vnc, "x11vnc")
+    if endpoint is not None:
+        vnc_host, vnc_port = endpoint
+    else:
+        if s is None:
+            raise ViewError("a reveal needs either a session or an endpoint")
+        x11vnc = which("x11vnc")
+        if not x11vnc:
+            raise ViewError("exporting a session's display needs x11vnc on this host")
+        vnc_host, vnc_port = "127.0.0.1", _free_port()
+
+        argv = [
+            x11vnc,
+            "-display", s.display,
+            "-rfbport", str(vnc_port),
+            "-localhost",      # never off-box; the tunnel is yggterm's job
+            "-nopw",           # loopback-only, and the surface is already gated
+            "-shared",         # THE co-browse flag: viewers do not evict each other
+            "-forever",        # the session outlives any one viewer
+            "-noxdamage",
+        ]
+        if read_only:
+            argv.append("-viewonly")
+        vnc = subprocess.Popen(
+            argv, env=_clean_env(s.display), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        _await_port(vnc_port, vnc, "x11vnc")
+        pids.append(vnc.pid)
 
     bridge = subprocess.Popen(
-        [websockify, "--web", root, f"127.0.0.1:{web_port}", f"127.0.0.1:{vnc_port}"],
+        [websockify, "--web", root, f"127.0.0.1:{web_port}", f"{vnc_host}:{vnc_port}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
     _await_port(web_port, bridge, "websockify")
+    pids.append(bridge.pid)
 
     # resize=scale IS the contract in URL form: the viewer scales to its window
     # and never asks the far end to change size.
@@ -166,21 +191,22 @@ def attach(
         + ("&view_only=1" if read_only else "")
     )
     viewer = Viewer(
-        target=s.target,
+        target=s.target if s else label,
         vnc_port=vnc_port,
         web_port=web_port,
         url=url,
-        pids=[vnc.pid, bridge.pid],
+        pids=pids,
         read_only=read_only,
         started_at=time.time(),
     )
-    s.viewers.append(viewer.as_dict())
-    sessions.save(s)
+    if s is not None:
+        s.viewers.append(viewer.as_dict())
+        sessions.save(s)
 
     emit("open", {
         "session": os.environ.get("YGGTERM_SESSION_ID", ""),
         "url": url,
-        "title": title or f"{s.target} ({s.geometry})",
+        "title": title or (f"{s.target} ({s.geometry})" if s else label),
     })
     return viewer
 
@@ -220,23 +246,23 @@ def _await_port(port: int, proc: subprocess.Popen, what: str, timeout: float = 1
     raise ViewError(f"{what} never listened on {port}")
 
 
-def detach(s: Session, viewer: Viewer | None = None) -> int:
+def detach(s: Session | None, viewer: Viewer | None = None) -> int:
     """Close viewers and tell yggterm.  The SESSION IS UNTOUCHED — that is the point."""
-    doomed = [viewer.as_dict()] if viewer else list(s.viewers)
+    doomed = [viewer.as_dict()] if viewer else list(s.viewers if s else [])
     for v in doomed:
         for pid in v.get("pids", []):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, TypeError):
                 pass
-    keep = [] if viewer is None else [v for v in s.viewers if v is not viewer.as_dict()]
-    s.viewers = keep
-    sessions.save(s)
+    if s is not None:
+        s.viewers = [] if viewer is None else [v for v in s.viewers if v != viewer.as_dict()]
+        sessions.save(s)
     emit("close", {"session": os.environ.get("YGGTERM_SESSION_ID", "")})
     return len(doomed)
 
 
-def hold(s: Session, viewer: Viewer, *, interval: float = HEARTBEAT_SECONDS) -> None:
+def hold(s: Session | None, viewer: Viewer, *, interval: float = HEARTBEAT_SECONDS) -> None:
     """Keep the surface alive until interrupted.
 
     The heartbeat is the liveness truth rather than a courtesy: a surface that
@@ -247,7 +273,7 @@ def hold(s: Session, viewer: Viewer, *, interval: float = HEARTBEAT_SECONDS) -> 
     payload = {
         "session": os.environ.get("YGGTERM_SESSION_ID", ""),
         "url": viewer.url,
-        "title": f"{s.target} ({s.geometry})",
+        "title": f"{s.target} ({s.geometry})" if s else viewer.target,
     }
 
     def _stop(signum, frame):  # noqa: ARG001
@@ -260,7 +286,7 @@ def hold(s: Session, viewer: Viewer, *, interval: float = HEARTBEAT_SECONDS) -> 
     previous = signal.signal(signal.SIGTERM, _stop)
     try:
         while True:
-            if not s.alive():
+            if s is not None and not s.alive():
                 print(
                     f"[yrdp] the session behind this view exited; closing the surface",
                     file=sys.stderr,
