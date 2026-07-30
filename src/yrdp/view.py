@@ -144,11 +144,11 @@ def attach(
         "-shared",             # THE co-browse flag: viewers do not evict each other
         "-forever",            # the session outlives any one viewer
         "-noxdamage",
-        "-quiet",
     ]
     if read_only:
         argv.append("-viewonly")
-    vnc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    env = _clean_env(s.display)
+    vnc = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     _await_port(vnc_port, vnc, "x11vnc")
 
     bridge = subprocess.Popen(
@@ -183,6 +183,27 @@ def attach(
         "title": title or f"{s.target} ({s.geometry})",
     })
     return viewer
+
+
+#: Desktop-session variables that must not reach a headless exporter.  Both were
+#: learned the hard way on a real workstation:
+#:
+#: * ``WAYLAND_DISPLAY`` — x11vnc sees it and refuses outright ("Wayland sessions
+#:   are as of now only supported…"), even though we are pointing it at our own
+#:   Xvfb. The inherited variable describes the OPERATOR'S session, which has
+#:   nothing to do with the surface we are exporting.
+#: * ``XAUTHORITY`` — points at that session's cookie, which our private display
+#:   will refuse; the headless display has no auth file of its own to offer.
+#:
+#: This is the same class of bug as a daemon's frozen environment poisoning every
+#: process it spawns: an inherited variable that describes a different world.
+INHERITED_DESKTOP_VARS = ("WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE")
+
+
+def _clean_env(display: str) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in INHERITED_DESKTOP_VARS}
+    env["DISPLAY"] = display
+    return env
 
 
 def _await_port(port: int, proc: subprocess.Popen, what: str, timeout: float = 15.0) -> None:
@@ -228,6 +249,15 @@ def hold(s: Session, viewer: Viewer, *, interval: float = HEARTBEAT_SECONDS) -> 
         "url": viewer.url,
         "title": f"{s.target} ({s.geometry})",
     }
+
+    def _stop(signum, frame):  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    # SIGTERM must unwind through the same path as Ctrl-C, or a `timeout`, a
+    # logout or a supervisor restart leaves the exporter and the bridge running
+    # with nobody announcing them — orphans holding ports that the next reveal
+    # then has to route around.
+    previous = signal.signal(signal.SIGTERM, _stop)
     try:
         while True:
             if not s.alive():
@@ -241,4 +271,5 @@ def hold(s: Session, viewer: Viewer, *, interval: float = HEARTBEAT_SECONDS) -> 
     except KeyboardInterrupt:
         pass
     finally:
+        signal.signal(signal.SIGTERM, previous)
         detach(s, viewer)

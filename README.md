@@ -1,9 +1,11 @@
 # yRDP
 
-**A general-purpose, agent-first RDP client.** It connects to any RDP host and presents
-that desktop as two surfaces: a **viewport surface** in the yggterm viewport for a person
-to use, and a **shadow surface** at fixed dimensions for an agent to drive from the command
-line.
+**A general-purpose, agent-first remote-desktop client.** It speaks **RDP or VNC**, and
+presents the far end as **one session with any number of viewers**: an agent drives it from
+the command line at fixed, contract-pinned dimensions, and a person reveals that very same
+session in the yggterm viewport whenever they want to watch or take over. Both at once is
+the normal case, not a special mode — an agent surface nobody can look at is an agent
+surface nobody can trust.
 
 The idea it is built around: *a surface pinned to fixed dimensions turns a GUI into an
 addressable one, and lore turns repeat traversal into roughly O(1).* You pay once,
@@ -31,7 +33,9 @@ bin/yrdp up     --target X             # run the site's own 'up' hook, wait for 
 bin/yrdp hook   --target X <name>      # any other site mechanism, same seam
 bin/yrdp exec   --target X "<command>" # run something on the machine hosting the target
 
-bin/yrdp open   --target X             # connect, pin the geometry, PRINT THE LORE
+bin/yrdp open   --target X [--vnc]     # connect, pin the geometry, PRINT THE LORE
+bin/yrdp view   --target X             # reveal that session in the yggterm viewport
+bin/yrdp view   --target X --read-only # watch without being able to act
 bin/yrdp screenshot --target X --rect 100,100,400,200    # crop first, per the ladder
 bin/yrdp do click --target X --at 840,412 --proven 1920x1080@1.0
 bin/yrdp do type "hello" ; bin/yrdp do key ctrl+shift+o
@@ -53,10 +57,8 @@ width = 1920            # rot the contract exists to stop.
 height = 1080
 scale = 1.0
 
-[surface]
-mode = "shadow"         # shadow (agent lane, built) | viewport (human lane, designed)
-
 [connection]
+protocol = "rdp"        # or "vnc" — one tool, not two. --vnc overrides.
 host = "host.example"
 port = 3389
 user = "someone"
@@ -83,5 +85,13 @@ down = ["..."]          # requirements — declare whatever your site actually h
 - **Recall is not optional.** Opening a session prints that target's lore, because a skill
   an agent must remember to load is a skill an agent forgets.
 
-Requires `xfreerdp3`, `Xvfb`, `xdotool` and ImageMagick on the host that runs it.
+**Viewers scale; they never resize.** Closing a view never touches the session, and a
+second viewer never evicts the first. That falls out of the geometry contract: the shared
+object is a fixed-size framebuffer, so there is no authoritative size for two viewers to
+fight over — which is why co-browse is easier here than for a terminal, whose grid *is* its
+geometry.
+
+Requires `Xvfb`, `xdotool` and ImageMagick, a client for the protocol in use (`xfreerdp3`
+or `xtigervncviewer`), and — for `view` — `x11vnc`, `websockify` and noVNC. It runs on any
+host that has them; nothing about it is tied to a particular machine.
 Read `docs/architecture.md` for the design and the reasoning behind each rule.

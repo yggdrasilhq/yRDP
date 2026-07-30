@@ -2,13 +2,19 @@
 
 ## 1. What it is
 
-yRDP connects to any RDP host and presents that remote desktop as **two surfaces**:
+yRDP connects to any **RDP or VNC** host and presents that remote desktop as **one session
+with any number of viewers**:
 
-- a **viewport surface** — the session composited into the yggterm viewport as a
-  libyggterm surface, the way a web surface is. This is the human lane: you look at it and
-  use it.
-- a **shadow surface** — the same session at **fixed dimensions**, with no window on any
-  screen, driven entirely from the command line. This is the agent lane.
+- the **canonical surface** — the session at **fixed dimensions**, pinned by the geometry
+  contract, driven entirely from the command line. It exists whether or not anyone is
+  watching. This is the agent lane.
+- a **reveal** — that same session shown in the yggterm viewport, attached and detached at
+  will, by as many viewers as care to look. This is the human lane, and it is also
+  co-browse.
+
+**A session must never exist in a vacuum.** These were once modelled as exclusive modes,
+which was exactly backwards: it left the surface an agent drives unwatchable, and an agent
+surface nobody can look at is an agent surface nobody can trust.
 
 Everything else in this document exists to serve one idea:
 
@@ -160,6 +166,20 @@ diagnosis.
   forgets.*
 - `YRDP_LORE_DIR` points at the store. There is no default: yRDP ships no lore and guesses
   no paths.
+
+## 8b. One tool, two protocols
+
+`protocol = "rdp" | "vnc"` in the target, `--vnc` on the command line. There is no second
+codebase, because everything that matters — the geometry contract, sessions, viewers, lore,
+hooks, credentials, the verb set — is protocol-independent. Two copies of one idea drift,
+always in the direction that costs a debugging session.
+
+`clients.py` is the single protocol-shaped seam, and an adapter owes four things: pin the
+surface to the contract geometry; **name** the flags that would let the far end resize us so
+they can be locked out by test (TigerVNC's `RemoteResize=1` is the exact analogue of RDP's
+`dynamic-resolution`); deliver the secret off argv; and classify failures into the **same
+named outcomes**, because the caller's recovery depends on the outcome and must never
+depend on the protocol.
 
 ## 9. Status
 

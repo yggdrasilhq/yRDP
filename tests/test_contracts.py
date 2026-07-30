@@ -72,6 +72,19 @@ def _write(tmp_path: Path, name: str, body: str) -> Path:
     return p
 
 
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path, monkeypatch):
+    """No test may touch the real state directory.
+
+    Learned by doing it: a lock that exercised detach() wrote a session record
+    called "t" into the live store, where it then showed up in `yrdp list` as a
+    dead session nobody could explain. A test that leaves droppings in the
+    thing it tests is worse than no test.
+    """
+    monkeypatch.setenv(config.STATE_DIR_ENV, str(tmp_path / "state"))
+    return tmp_path
+
+
 @pytest.fixture()
 def targets(tmp_path, monkeypatch):
     monkeypatch.setenv(config.TARGETS_DIR_ENV, str(tmp_path))
