@@ -77,7 +77,56 @@ Enforced at the point of action, in three places:
 
 A human watching must not be able to renegotiate the agent lane's geometry by resizing a
 window. The viewport surface is a **viewer**; if it needs a different size it gets a scaled
-view of the canonical surface, never a resize of it.
+view of the canonical surface, never a resize of it. That is `attach --scaled`, and it is
+the default because the agent's contract is expensive to rebuild while the human's
+discomfort is recoverable by leaning in.
+
+### The geometry epoch — because a contract that CAN change needs a way to say when
+
+Sometimes the surface really does change size: a guest's display settings, a viewer that
+adopts the surface so the human gets a pixel-exact view, an operator editing a launcher.
+Re-pinning is legitimate. Re-pinning **silently** is not, and it fails in a specific and
+nasty shape the user named before it happened:
+
+> an agent screenshots at 1920x1080 · a human adopts the surface at 1600x900 · the agent
+> clicks a coordinate it read off *its own screenshot*
+
+Every existing check passes. There is no `--proven` stamp to compare, because the rule
+correctly says to omit it for a coordinate you just read off this session's own screenshot.
+The point is inside the new surface. The far end now agrees with the new contract. So the
+click lands somewhere meaningless, the agent cannot see why, **and it keeps trying** — the
+expensive rung silently stops paying back.
+
+A warning in a document cannot prevent that, because the agent that is failing has already
+read the document and still does not know that *this* surface moved. So the invalidation is
+carried in the data:
+
+- `Session.geometry_epoch` is bumped by `session.repin()`, the **one** door through which
+  the contract may change. `repin` also records `resized_by` and `resized_at`, and is
+  idempotent — attaching a viewer at the contract geometry changes nothing and therefore
+  invalidates nothing, or co-browse would cost the agent its coordinates every time a human
+  glanced at the surface.
+- **Observations stamp the epoch.** `screenshot` returns `epoch` and sets
+  `observed_at_epoch`, because a picture is the only thing that actually re-synchronises an
+  agent with a surface somebody moved.
+- **Actions check it.** `do click --from-epoch N` is refused when N is not current; and a
+  click with *no* epoch is refused outright while `observed_at_epoch != geometry_epoch`.
+  That unstamped case is the hole above, and closing it is the point of the whole
+  mechanism.
+- **`state` reports `geometry_stale` and `resized_ago`**, because the first command an
+  agent runs when something stops working is `state`. If the answer to "why did my clicks
+  stop landing?" is not in the first command, the agent looks in the wrong place.
+
+A session is born *observed* (`observed_at_epoch == geometry_epoch == 0`), so replaying
+lore proven at the contract geometry never requires taking a picture first — making the
+pixel rung a prerequisite for the cheap rungs would be exactly backwards.
+
+**Not built yet:** `attach --adopt` as a single verb. For yRDP the surface size is the *far
+end's* size, so adopting means re-opening the session at the viewer's geometry — real for
+RDP (which negotiates `/size:`), impossible for a hypervisor console that is 1280x800
+because the guest says so. Until that lands, an adopt is expressed honestly as
+`yrdp repin --geometry WxH --by "viewer adopt"` after the far end really is that size;
+`--by` is required so the refusal it causes can name a cause.
 
 ## 4. The ladder (path of least resistance)
 

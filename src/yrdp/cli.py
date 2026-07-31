@@ -189,6 +189,40 @@ def cmd_close(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_repin(args: argparse.Namespace) -> int:
+    """Re-pin a live session's contract geometry, on the record.
+
+    A contract that can change needs ONE door, and this is it.  The far end
+    really does change size sometimes — a guest's display settings, a launcher
+    edited, a viewer that adopted the surface — and when it does, the honest
+    move is to say so rather than to let a stale contract quietly refuse every
+    click with a message about the wrong thing.
+
+    Re-pinning INVALIDATES every coordinate read before it.  That is the whole
+    point, and it is why ``--by`` is required: a refusal that can name who moved
+    the surface, and when, ends an investigation in one sentence instead of
+    sending the next agent to debug an input path that was never broken.
+    """
+    s = session.live_session(args.target)
+    previous, previous_epoch = s.geometry, s.geometry_epoch
+    changed = session.repin(s, args.geometry, by=args.by)
+    return _emit(
+        {
+            "target": args.target,
+            "changed": changed,
+            "geometry": s.geometry,
+            "previous": previous,
+            "epoch": s.geometry_epoch,
+            "previous_epoch": previous_epoch,
+            "resized_by": s.resized_by,
+        },
+        f"{args.target}: {previous} → {s.geometry} (epoch {s.geometry_epoch}), "
+        f"every coordinate read before now is refused until you re-observe"
+        if changed
+        else f"{args.target}: already {s.geometry}; nothing re-pinned, nothing invalidated",
+    )
+
+
 def cmd_screenshot(args: argparse.Namespace) -> int:
     s = session.live_session(args.target)
     rect = None
@@ -212,7 +246,7 @@ def cmd_do(args: argparse.Namespace) -> int:
         if not args.at:
             raise SystemExit(f"[{PROG}] click needs --at X,Y")
         x, y = (int(v) for v in args.at.split(","))
-        session.click(s, x, y, button=args.button, proven=args.proven)
+        session.click(s, x, y, button=args.button, proven=args.proven, from_epoch=args.from_epoch)
         did = f"click {x},{y}"
     elif args.action == "type":
         session.type_text(s, args.text or "")
@@ -331,6 +365,17 @@ def build_parser() -> argparse.ArgumentParser:
     op.add_argument("--vnc", action="store_true", help="speak VNC instead of the target's protocol")
     op.set_defaults(func=cmd_open)
 
+    rp = wt(sub.add_parser("repin", help="change a live session's contract geometry, on the record"))
+    rp.add_argument("--geometry", required=True, help="the new contract, e.g. 1600x900@1.0")
+    rp.add_argument(
+        "--by",
+        required=True,
+        help="WHO is changing it (e.g. 'viewer adopt', 'guest display settings'). Required "
+        "because the refusal this causes has to be able to name a cause — 'stale' sends "
+        "the reader hunting, 'a viewer adopted this 4m ago' ends it.",
+    )
+    rp.set_defaults(func=cmd_repin)
+
     vw = wt(sub.add_parser("view", help="reveal a live session in the yggterm viewport"))
     vw.add_argument("--read-only", action="store_true", help="watch without being able to act")
     vw.add_argument("--title", help="surface title shown by yggterm")
@@ -365,6 +410,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="the geometry this coordinate was proven at (from lore). A mismatch is "
         "REFUSED, never approximated; omit it only for a coordinate you just read "
         "off this session's own screenshot.",
+    )
+    do.add_argument(
+        "--from-epoch",
+        type=int,
+        help="the geometry epoch this coordinate was read at — the `epoch` field a "
+        "screenshot returns. Quoting it lets the refusal be exact. Without it, a "
+        "coordinate is refused outright while the surface has been re-pinned since "
+        "the last observation, because that is the case where every other check "
+        "passes and the click still lands in the wrong place.",
     )
     do.set_defaults(func=cmd_do)
 

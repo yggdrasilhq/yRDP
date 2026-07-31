@@ -97,6 +97,30 @@ class Session:
     #: perfectly good session — it is simply unwatched at this moment.
     viewers: list[dict] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
+    #: ---- the geometry epoch: why a resize cannot silently rot a coordinate ---
+    #:
+    #: ``geometry`` is the contract, and a contract that can be RE-PINNED needs a
+    #: way to say *when* it changed, because the dangerous case leaves no other
+    #: trace.  An agent screenshots at 1920x1080, a human attaches in adopt mode
+    #: at 1600x900, and the agent then clicks a coordinate it read off its own
+    #: screenshot.  Every check passes — no ``--proven`` stamp to compare, the
+    #: point is inside the new surface, and the far end now agrees with the new
+    #: contract — and the click lands somewhere meaningless.  The agent has no
+    #: way to see why, and (this is the part the user named) will keep trying.
+    #:
+    #: So the surface counts its own re-pins, every observation records which
+    #: count it was taken at, and an action derived from an older one is refused.
+    geometry_epoch: int = 0
+    #: Who caused the last re-pin, and when.  A refusal that says only "stale"
+    #: sends the reader hunting; one that says "a viewer adopted this surface
+    #: four minutes ago" ends the investigation in the first sentence.
+    resized_by: str = ""
+    resized_at: float = 0.0
+    #: The epoch of the most recent OBSERVATION (a screenshot).  Born equal to
+    #: ``geometry_epoch``: a session that has just been pinned is not stale, and
+    #: replaying lore proven at the contract geometry must not require taking a
+    #: picture first.  It falls behind only when something re-pins the surface.
+    observed_at_epoch: int = 0
 
     @property
     def geom(self) -> Geometry:
@@ -537,8 +561,77 @@ def _xdo(s: Session, *args: str, timeout: float = 20.0) -> str:
     return p.stdout
 
 
-def check_point(s: Session, x: int, y: int, proven: str | None) -> None:
-    """Both halves of the contract, at the point of action."""
+def _ago(then: float) -> str:
+    if then <= 0:
+        return "at an unrecorded time"
+    seconds = max(0, int(time.time() - then))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}m{seconds:02d}s ago"
+
+
+def repin(s: Session, geometry: str, *, by: str) -> bool:
+    """Change the contract, and make the change impossible to miss.
+
+    The ONE owner of a geometry change.  Everything that could re-pin a surface
+    goes through here so that the epoch, the attribution and the timestamp
+    cannot drift apart — three fields updated in three places is three chances
+    for a resize to leave no trace, and a resize that leaves no trace is exactly
+    the failure this machinery exists to prevent.
+
+    Idempotent on purpose: re-pinning to the size it already is means nothing
+    changed, so nothing is invalidated.  A viewer that attaches at the contract
+    geometry must not cost the agent its coordinates.
+    """
+    if geometry == s.geometry:
+        return False
+    previous = s.geometry
+    s.geometry = geometry
+    s.geometry_epoch += 1
+    s.resized_by = by
+    s.resized_at = time.time()
+    s.events.append(f"re-pinned {previous} → {geometry} by {by} (epoch {s.geometry_epoch})")
+    save(s)
+    return True
+
+
+def _stale_geometry_detail(s: Session) -> str:
+    who = s.resized_by or "something"
+    return (
+        f"this surface was re-pinned to {s.geometry} by {who} {_ago(s.resized_at)} "
+        f"(epoch {s.observed_at_epoch} → {s.geometry_epoch})"
+    )
+
+
+def check_point(
+    s: Session, x: int, y: int, proven: str | None, *, from_epoch: int | None = None
+) -> None:
+    """Every half of the contract, at the point of action.
+
+    Three refusals, and the third is the one that is easy to leave out:
+
+    1. a coordinate stamped at another geometry (``--proven``),
+    2. a coordinate outside the surface,
+    3. a coordinate derived from an OBSERVATION THAT PREDATES A RE-PIN — the
+       unstamped case, where nothing else in the system disagrees.
+    """
+    if from_epoch is not None and from_epoch != s.geometry_epoch:
+        raise SessionError(
+            f"refusing click at {x},{y}: it was read at epoch {from_epoch} and "
+            f"{_stale_geometry_detail(s)}. Take a fresh screenshot and read the "
+            f"coordinate again, or re-attach the viewer with --scaled so the "
+            f"surface stops moving under you."
+        )
+    if from_epoch is None and s.observed_at_epoch != s.geometry_epoch:
+        raise SessionError(
+            f"refusing click at {x},{y}: no epoch was given, and {_stale_geometry_detail(s)} "
+            f"— so an unstamped coordinate cannot be trusted to belong to the surface "
+            f"that exists now. This is the case where every other check passes and the "
+            f"click still lands in the wrong place. Take a fresh screenshot (which "
+            f"re-observes the surface and clears this), or pass --proven/--from-epoch "
+            f"to say what it was read against."
+        )
     require_match(s.geom, proven, what=f"click at {x},{y}")
     g = s.geom
     if not (0 <= x < g.width and 0 <= y < g.height):
@@ -580,8 +673,16 @@ def _rfb_client(s: Session, *, what: str, require_contract: bool) -> rfb.RfbClie
     return client
 
 
-def click(s: Session, x: int, y: int, *, button: int = 1, proven: str | None = None) -> None:
-    check_point(s, x, y, proven)
+def click(
+    s: Session,
+    x: int,
+    y: int,
+    *,
+    button: int = 1,
+    proven: str | None = None,
+    from_epoch: int | None = None,
+) -> None:
+    check_point(s, x, y, proven, from_epoch=from_epoch)
     if _direct(s):
         with _rfb_client(s, what=f"click at {x},{y}", require_contract=True) as c:
             with _rfb_errors("click"):
@@ -681,6 +782,12 @@ def screenshot(
             "observed": s.geometry,
             "complete": True,
         }
+    # A capture IS the observation, so taking one is what re-synchronises an
+    # agent with a surface somebody moved. Stamping the epoch into the result is
+    # not decoration either: it is the token a later click quotes back, and the
+    # only honest way to say WHICH surface state these pixels describe.
+    s.observed_at_epoch = s.geometry_epoch
+    result["epoch"] = s.geometry_epoch
     s.last_verb = "screenshot"
     save(s)
     return result
@@ -692,4 +799,10 @@ def describe(s: Session) -> dict[str, Any]:
         "alive": s.alive(),
         "age_s": round(time.time() - s.opened_at, 1),
         "viewer_count": len([v for v in s.viewers if _alive((v.get("pids") or [0])[0])]),
+        # The first command an agent runs when something stops working is
+        # `state`. If the answer to "why did my clicks stop landing?" is not in
+        # THIS output, the agent will go looking in the wrong place — which is
+        # precisely the failure mode the epoch exists to end.
+        "geometry_stale": s.observed_at_epoch != s.geometry_epoch,
+        "resized_ago": _ago(s.resized_at) if s.resized_at else None,
     }

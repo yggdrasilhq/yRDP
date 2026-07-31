@@ -532,3 +532,116 @@ def test_a_type_this_client_cannot_speak_says_so_without_inventing_a_reason():
     message = str(caught.value)
     assert "30" in message and "33" in message, "the refusal must name what was offered"
     assert "adapter" not in message.lower(), "do not prescribe a fix that was never needed"
+
+
+# -- the geometry epoch: a resize must not be able to rot a coordinate quietly --
+
+
+def test_a_fresh_session_is_not_stale_and_replays_lore_without_a_screenshot(monkeypatch):
+    """Being born must not count as having been moved.
+
+    The epoch guard has to bite on a RE-PIN and on nothing else.  If a session
+    started out 'unobserved', every agent would be forced to take a screenshot
+    before replaying a coordinate the lore already proved — which would make the
+    pixel rung mandatory to use the cheap one, exactly backwards.
+    """
+    from yrdp import session
+
+    s = _session()
+    assert s.geometry_epoch == s.observed_at_epoch
+    session.check_point(s, 100, 100, None)  # no screenshot taken, and that is fine
+    session.check_point(s, 100, 100, "1920x1080@1.0")
+
+
+def test_an_unstamped_coordinate_is_refused_after_someone_repins(monkeypatch, tmp_path):
+    """THE case this machinery exists for, and the one nothing else catches.
+
+    An agent screenshots at 1920x1080; a human attaches in adopt mode and the
+    surface becomes 1600x900; the agent clicks a coordinate it read off its own
+    screenshot.  ``--proven`` was omitted (correctly, by the old rule), the point
+    is inside the new surface, and the far end now agrees with the new contract —
+    so every other check PASSES and the click lands somewhere meaningless.
+    """
+    from yrdp import session
+
+    monkeypatch.setattr(session, "sessions_dir", lambda: tmp_path)
+    s = _session()
+    session.check_point(s, 800, 400, None)  # fine before anyone moves anything
+
+    assert session.repin(s, "1600x900@1.0", by="viewer 'seat' adopt") is True
+    assert s.geometry_epoch == 1 and s.observed_at_epoch == 0
+
+    with pytest.raises(session.SessionError) as caught:
+        session.check_point(s, 800, 400, None)
+    message = str(caught.value)
+    assert "1600x900@1.0" in message, "the refusal must name what the surface became"
+    assert "viewer 'seat' adopt" in message, "and WHO moved it — 'stale' sends the reader hunting"
+
+    # Re-observing is what clears it, because a fresh picture is the only thing
+    # that actually re-synchronises the agent with the surface.
+    s.observed_at_epoch = s.geometry_epoch
+    session.check_point(s, 800, 400, None)
+
+
+def test_a_quoted_epoch_is_checked_exactly(monkeypatch, tmp_path):
+    """An explicit stamp beats an inferred one, in both directions."""
+    from yrdp import session
+
+    monkeypatch.setattr(session, "sessions_dir", lambda: tmp_path)
+    s = _session()
+    session.repin(s, "1600x900@1.0", by="guest display settings")
+    s.observed_at_epoch = s.geometry_epoch  # observed AFTER the change
+
+    session.check_point(s, 10, 10, None, from_epoch=1)  # current: allowed
+    with pytest.raises(session.SessionError) as caught:
+        session.check_point(s, 10, 10, None, from_epoch=0)  # read before it moved
+    assert "epoch 0" in str(caught.value)
+
+
+def test_repinning_to_the_same_size_invalidates_nothing(monkeypatch, tmp_path):
+    """A viewer that attaches at the contract geometry must cost nothing.
+
+    If any attach bumped the epoch, the default (scaled) attach would invalidate
+    the agent's coordinates every time a human glanced at the surface — which
+    would make co-browse expensive and teach agents to avoid it.
+    """
+    from yrdp import session
+
+    monkeypatch.setattr(session, "sessions_dir", lambda: tmp_path)
+    s = _session()
+    assert session.repin(s, "1920x1080@1.0", by="viewer 'seat' scaled") is False
+    assert s.geometry_epoch == 0
+    assert s.resized_by == ""
+    session.check_point(s, 800, 400, None)
+
+
+def test_a_screenshot_stamps_the_epoch_it_was_taken_at(monkeypatch, tmp_path):
+    """The returned pixels have to say WHICH surface state they describe."""
+    from yrdp import session
+
+    monkeypatch.setattr(session, "sessions_dir", lambda: tmp_path)
+    s = _session()
+    session.repin(s, "1600x900@1.0", by="guest display settings")
+    assert session.describe(s)["geometry_stale"] is True
+
+    monkeypatch.setattr(session, "_direct", lambda _s: True)
+    monkeypatch.setattr(session, "_rfb_client", lambda *a, **k: _FakeRfb())
+    out = tmp_path / "shot.png"
+    result = session.screenshot(s, out)
+    assert result["epoch"] == s.geometry_epoch == 1
+    assert session.describe(s)["geometry_stale"] is False
+
+
+class _FakeRfb:
+    """Just enough of an RFB client for the capture path."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def capture(self):
+        from yrdp.rfb import Frame
+
+        return Frame(2, 2, bytearray(2 * 2 * 4), complete=True)
