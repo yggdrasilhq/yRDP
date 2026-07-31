@@ -241,7 +241,22 @@ exists and why nothing else may import it.
 
 - **A native libyggterm surface** for the reveal — the framebuffer composited directly, no
   browser and no VNC hop. Better endgame, yggterm-side work.
-- **The accessibility rung (3)** for any platform.
 - **A session lease**, so a long agent flow is not reaped mid-way.
-- **Apple's own VNC security type**, which is what a macOS Screen Sharing endpoint asks
-  for. The direct client names it in its refusal rather than failing vaguely.
+
+**Answered, 2026-07-31 — two items left this list without any code being written:**
+
+- **The accessibility rung (3)** exists for Windows, and it is not in this repo. It is a
+  UIAutomation helper the target runs as a site `[hooks]` entry, because "how do I get a
+  semantic tree out of THAT machine" is site knowledge and yRDP's identity is its
+  generality. Proven against Excel (rich tree: named buttons, `msotcidPlaceOpen`,
+  invoke/gettext/focus all working). Two of the four consumers publish **no** tree at all —
+  TWS is Java Swing, PL9 is Qt5 — which is the ladder working rather than a gap: those
+  two have better rungs (the IB API under IBC; PL9's own export paths).
+- **Apple's own VNC security type** turned out never to be needed. A macOS Screen Sharing
+  endpoint announces `RFB 003.889` and offers types `30, 33, 35, 36, 2` — Apple's four
+  **and** ordinary VNC password auth, which this client already speaks. Connecting to a
+  live macOS 26.4.1 guest works today: version clamped 889 → 3.8, type 2 chosen,
+  1280x800 framebuffer, desktop name `iMac`. Both halves are locked by test with the
+  mutations proven red. (That endpoint then paints an all-black framebuffer on that
+  particular guest, for reasons that belong to the guest and not to this client — it has
+  no GPU kext. The hypervisor console is the surface there.)

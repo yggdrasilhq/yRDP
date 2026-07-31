@@ -442,8 +442,9 @@ def _handshake_security(sock: socket.socket, version: str, password: str | None)
         else:
             raise RfbAuthError(
                 f"the server offers only security types {sorted(offered)}; this client "
-                f"speaks None and VNC password authentication. A macOS Screen Sharing "
-                f"endpoint, for instance, wants Apple's own type and needs its own adapter."
+                f"speaks None (1) and VNC password authentication (2). Nothing here is "
+                f"one of those, so the endpoint needs a type this client does not "
+                f"implement."
             )
         sock.sendall(bytes((chosen,)))
 

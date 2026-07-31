@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import shlex
+import struct
 import sys
 import textwrap
 import zlib
@@ -468,3 +469,66 @@ def test_an_unknown_protocol_is_refused_not_defaulted(targets):
     """)
     with pytest.raises(config.ConfigError, match="telepathy"):
         config.load_target("p")
+
+
+class _ScriptedSocket:
+    """A socket that replays a server's bytes and records what we sent."""
+
+    def __init__(self, script: bytes):
+        self._script = script
+        self._at = 0
+        self.sent = bytearray()
+
+    def recv(self, count: int) -> bytes:
+        chunk = self._script[self._at:self._at + count]
+        self._at += len(chunk)
+        return chunk
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+
+def test_an_apple_endpoint_is_spoken_to_with_the_ordinary_password_type():
+    """macOS Screen Sharing offers Apple's own types AND plain VNC auth.
+
+    This client only ever needed the ordinary one.  The endpoint announces
+    ``RFB 003.889`` — a minor version far past 8 — and security types
+    ``30, 33, 35, 36, 2``.  Two things have to hold or the connection dies on a
+    live macOS guest: the version has to be CLAMPED to 3.8 rather than echoed
+    back, and type 2 has to be chosen out of a list whose first four entries are
+    Apple's.  Both were proven against the real endpoint on 2026-07-31, which
+    also falsified the old error text claiming an Apple adapter was required.
+    """
+    apple_offer = bytes([5, 30, 33, 36, 2, 35])
+    sock = _ScriptedSocket(b"RFB 003.889\n" + apple_offer + struct.pack(">I", 0))
+
+    version = rfb._handshake_version(sock)
+    assert version == "3.8", "889 must clamp to the highest version we speak, not echo back"
+    assert bytes(sock.sent) == b"RFB 003.008\n"
+
+    sock.sent.clear()
+    # The DES response follows the challenge, so give it one.
+    sock._script = sock._script[:0] + apple_offer + b"\x00" * 16 + struct.pack(">I", 0)
+    sock._at = 0
+    rfb._handshake_security(sock, version, "hunter2")
+    assert sock.sent[0] == rfb.SECURITY_VNC_AUTH, (
+        f"chose security type {sock.sent[0]} out of {list(apple_offer[1:])}; "
+        f"type {rfb.SECURITY_VNC_AUTH} is the one this client implements"
+    )
+
+
+def test_a_type_this_client_cannot_speak_says_so_without_inventing_a_reason():
+    """The refusal names the offer and stops.
+
+    It used to assert that a macOS Screen Sharing endpoint needs an Apple
+    adapter.  That was wrong — macOS offers plain VNC auth as well — and a
+    confidently wrong error sends the next reader to build something that was
+    never needed.
+    """
+    only_apple = bytes([2, 30, 33])
+    sock = _ScriptedSocket(only_apple)
+    with pytest.raises(rfb.RfbAuthError) as caught:
+        rfb._handshake_security(sock, "3.8", "hunter2")
+    message = str(caught.value)
+    assert "30" in message and "33" in message, "the refusal must name what was offered"
+    assert "adapter" not in message.lower(), "do not prescribe a fix that was never needed"
