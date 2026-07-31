@@ -35,16 +35,22 @@ import signal
 import socket
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from shutil import which
 from typing import Any
 
-from . import clients
-from .config import ConfigError, Target, state_dir
+from . import clients, rfb
+from .config import ConfigError, Target, load_target, state_dir
 from .geometry import Geometry, require_match
 
 CONNECT_TIMEOUT = 45.0
+
+#: A direct RFB conversation is opened per verb and closed again, so this bounds
+#: a single act, not a session.  Kept short: the endpoint either answers or the
+#: caller wants to know that it did not.
+RFB_TIMEOUT = 15.0
 
 
 class SessionError(Exception):
@@ -79,6 +85,14 @@ class Session:
     window_found: bool = False
     lease_until: float | None = None
     last_verb: str = "open"
+    #: How this surface is held: a headless display with a client binary in it,
+    #: or the protocol spoken directly.  Defaults to x11 so a record written by
+    #: an older build still loads and still means what it said.
+    backend: str = clients.BACKEND_X11
+    #: What the far end declared it actually is, at the last connect.  The
+    #: contract lives in ``geometry``; this is the measurement, and the two
+    #: disagreeing is a fact worth carrying rather than averaging away.
+    server_geometry: str = ""
     #: Attached viewers, appended by view.py.  A session with none is still a
     #: perfectly good session — it is simply unwatched at this moment.
     viewers: list[dict] = field(default_factory=list)
@@ -88,7 +102,26 @@ class Session:
     def geom(self) -> Geometry:
         return Geometry.parse(self.geometry)
 
+    @property
+    def endpoint(self) -> tuple[str, int]:
+        host, _, port = self.host.rpartition(":")
+        return host, int(port)
+
     def alive(self) -> bool:
+        """Alive means something different for each backend, honestly.
+
+        An x11 session is two processes we own, so their existence is the truth.
+        A direct RFB session owns no process at all — what makes it usable is
+        that the far end still answers, so that is what we ask.  Reporting a
+        pid-based 'alive' for a backend with no pids would be a comforting lie.
+        """
+        if self.backend == clients.BACKEND_RFB:
+            host, port = self.endpoint
+            try:
+                with socket.create_connection((host, port), timeout=1.5):
+                    return True
+            except (OSError, ValueError):
+                return False
         return _alive(self.client_pid) and _alive(self.xvfb_pid)
 
 
@@ -141,6 +174,11 @@ def live_session(target: str) -> Session:
 
 
 def _alive(pid: int) -> bool:
+    # pid 0 means "this process group" to kill(2), so a record with no process —
+    # every rfb session — must never reach it. Guarding here rather than at each
+    # call site: there is one right answer and this is where it belongs.
+    if not pid or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -253,6 +291,9 @@ def open_session(
     adapter = clients.ADAPTERS[proto]
     password = resolve_password(target, password_entry, required=adapter.credential_required)
 
+    if adapter.backend == clients.BACKEND_RFB:
+        return _open_direct(target, proto, password)
+
     xvfb, client, xdotool = _require("Xvfb"), _require(adapter.binary), _require("xdotool")
     geom = target.geometry
     display = _free_display()
@@ -294,6 +335,68 @@ def open_session(
         raise
     save(session)
     return session
+
+
+def _open_direct(target: Target, proto: str, password: str | None) -> Session:
+    """Open a session for a protocol we speak ourselves.
+
+    There is no display to create and no client to supervise, so 'opening' is:
+    prove the endpoint really talks the protocol, measure what it actually is,
+    and record the contract we will hold it to.  Everything the record exists
+    for — being findable by another agent, carrying viewers, being closed by
+    someone who did not open it — works exactly as it does for the x11 backend.
+    """
+    conn = target.connection
+    assert conn is not None  # open_session checked; this keeps the type honest
+    with _rfb_errors("open"):
+        client = rfb.RfbClient.connect(
+            conn.host, conn.port, password=password, timeout=RFB_TIMEOUT
+        )
+        observed = client.geometry
+        name, version = client.name, client.version
+        client.close()
+
+    session = Session(
+        target=target.name,
+        geometry=target.geometry.stamp,
+        display="",
+        xvfb_pid=0,
+        client_pid=0,
+        host=f"{conn.host}:{conn.port}",
+        user=conn.user,
+        opened_at=time.time(),
+        protocol=proto,
+        backend=clients.BACKEND_RFB,
+        server_geometry=observed,
+        window_found=True,
+    )
+    session.events.append(f"RFB {version} · {name!r} · framebuffer {observed}")
+    if observed != session.geometry:
+        # Not a failure: looking is still allowed and still useful. But every
+        # coordinate is now meaningless, and saying so once here beats a click
+        # that lands somewhere plausible and wrong.
+        session.events.append(
+            f"⚠ the far end is {observed}, the contract says {session.geometry}; "
+            f"coordinate verbs will refuse until they agree"
+        )
+    save(session)
+    return session
+
+
+@contextmanager
+def _rfb_errors(what: str):
+    """One place where the protocol's failures become the tool's named outcomes.
+
+    The x11 backend earns these by matching strings in a client's stderr; here
+    they arrive as types. Same two outcomes either way, because the caller's
+    recovery depends on the outcome and must never depend on the protocol.
+    """
+    try:
+        yield
+    except rfb.RfbAuthError as exc:
+        raise AuthRefused(str(exc)) from exc
+    except rfb.RfbError as exc:
+        raise SessionError(f"{what}: {exc}") from exc
 
 
 def _reap(*procs: subprocess.Popen) -> None:
@@ -410,6 +513,8 @@ def close_session(target: str, *, quiet: bool = False) -> bool:
 
 
 def _kill(pid: int, sig: int = signal.SIGTERM) -> None:
+    if not pid or pid <= 0:  # never signal our own process group by accident
+        return
     try:
         os.kill(pid, sig)
     except (ProcessLookupError, PermissionError, TypeError):
@@ -443,48 +548,142 @@ def check_point(s: Session, x: int, y: int, proven: str | None) -> None:
         )
 
 
+def _direct(s: Session) -> bool:
+    return s.backend == clients.BACKEND_RFB
+
+
+def _rfb_client(s: Session, *, what: str, require_contract: bool) -> rfb.RfbClient:
+    """Connect for one act, and hold the far end to the contract when it matters.
+
+    ``require_contract`` is the honest split between looking and acting.  A
+    screenshot of a surface that has changed size is still true and still worth
+    having; a CLICK on one is a coordinate replayed against a surface it was
+    never proven on, which is precisely what the contract exists to refuse.
+    """
+    target = load_target(s.target)
+    password = resolve_password(target, required=False)
+    host, port = s.endpoint
+    with _rfb_errors(what):
+        client = rfb.RfbClient.connect(host, port, password=password, timeout=RFB_TIMEOUT)
+    observed = client.geometry
+    if observed != s.server_geometry:
+        s.server_geometry = observed
+        save(s)
+    if require_contract and observed != s.geometry:
+        client.close()
+        raise SessionError(
+            f"refusing {what}: this session is pinned at {s.geometry} but the far end is "
+            f"now {observed}. A coordinate proven on one surface means nothing on "
+            f"another — re-measure, then update the target's [geometry] if the change "
+            f"is the new truth. Screenshots still work at the size it really is."
+        )
+    return client
+
+
 def click(s: Session, x: int, y: int, *, button: int = 1, proven: str | None = None) -> None:
     check_point(s, x, y, proven)
-    _xdo(s, "mousemove", "--sync", str(x), str(y))
-    _xdo(s, "click", str(button))
+    if _direct(s):
+        with _rfb_client(s, what=f"click at {x},{y}", require_contract=True) as c:
+            with _rfb_errors("click"):
+                c.click(x, y, button=button)
+    else:
+        _xdo(s, "mousemove", "--sync", str(x), str(y))
+        _xdo(s, "click", str(button))
     s.last_verb = f"click {x},{y}"
     save(s)
 
 
 def type_text(s: Session, text: str, *, delay_ms: int = 12) -> None:
-    _xdo(s, "type", "--delay", str(delay_ms), "--", text)
+    if _direct(s):
+        # Typing is geometry-free — it goes to whatever has focus — so it does
+        # not need the contract to hold.
+        with _rfb_client(s, what="type", require_contract=False) as c:
+            with _rfb_errors("type"):
+                c.type_text(text, delay_ms=delay_ms)
+    else:
+        _xdo(s, "type", "--delay", str(delay_ms), "--", text)
     s.last_verb = "type"
     save(s)
 
 
-def key(s: Session, chord: str) -> None:
-    _xdo(s, "key", "--clearmodifiers", chord)
+def key(s: Session, chord: str, *, hold_ms: int = 0) -> None:
+    """Strike a chord, optionally holding it down.
+
+    The hold is not decoration.  Firmware, boot pickers and BIOS-era menus poll
+    the keyboard on a slow loop and can miss a press released within a frame,
+    which looks exactly like "keys never arrive" — the most misleading symptom
+    there is, because it sends the next person to debug the input path that was
+    working all along.
+    """
+    if _direct(s):
+        with _rfb_client(s, what=f"key {chord}", require_contract=False) as c:
+            with _rfb_errors("key"):
+                c.press(chord, hold_ms=hold_ms)
+    elif hold_ms > 0:
+        mods, _, key_name = chord.rpartition("+")
+        for mod in [m for m in mods.split("+") if m]:
+            _xdo(s, "keydown", mod)
+        _xdo(s, "keydown", key_name)
+        time.sleep(hold_ms / 1000.0)
+        _xdo(s, "keyup", key_name)
+        for mod in reversed([m for m in mods.split("+") if m]):
+            _xdo(s, "keyup", mod)
+    else:
+        _xdo(s, "key", "--clearmodifiers", chord)
     s.last_verb = f"key {chord}"
     save(s)
 
 
-def screenshot(s: Session, out: Path, *, rect: tuple[int, int, int, int] | None = None) -> Path:
-    """Capture the pinned surface, crop-first per the ladder when asked."""
+def screenshot(
+    s: Session, out: Path, *, rect: tuple[int, int, int, int] | None = None
+) -> dict[str, Any]:
+    """Capture the surface, crop-first per the ladder when asked.
+
+    Returns what was actually captured rather than only where it was written:
+    the size the far end really is, and whether every rectangle had arrived.  A
+    partly-painted frame is a good diagnostic and a terrible thing to mistake
+    for a whole one.
+    """
     out.parent.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "DISPLAY": s.display}
-    grabber = which("import") or which("magick")
-    if grabber is None:
-        raise SessionError("no ImageMagick on this host, so the pixel rung cannot capture")
-    argv = [grabber] + ([] if grabber.endswith("import") else ["import"])
-    argv += ["-window", "root"]
-    if rect:
-        x, y, w, h = rect
-        g = s.geom
-        if x < 0 or y < 0 or x + w > g.width or y + h > g.height:
-            raise SessionError(f"refusing crop {rect}: not inside the pinned surface {g.stamp}")
-        argv += ["-crop", f"{w}x{h}+{x}+{y}"]
-    argv.append(str(out))
-    p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
-    if p.returncode != 0:
-        raise SessionError(f"capture failed: {p.stderr.strip()[:300]}")
+    if _direct(s):
+        with _rfb_client(s, what="screenshot", require_contract=False) as c:
+            with _rfb_errors("screenshot"):
+                frame = c.capture()
+        if rect:
+            frame = frame.crop(*rect)
+        frame.write_png(out)
+        result = {
+            "path": str(out),
+            "geometry": s.geometry,
+            "observed": s.server_geometry,
+            "complete": frame.complete,
+        }
+    else:
+        env = {**os.environ, "DISPLAY": s.display}
+        grabber = which("import") or which("magick")
+        if grabber is None:
+            raise SessionError("no ImageMagick on this host, so the pixel rung cannot capture")
+        argv = [grabber] + ([] if grabber.endswith("import") else ["import"])
+        argv += ["-window", "root"]
+        if rect:
+            x, y, w, h = rect
+            g = s.geom
+            if x < 0 or y < 0 or x + w > g.width or y + h > g.height:
+                raise SessionError(f"refusing crop {rect}: not inside the pinned surface {g.stamp}")
+            argv += ["-crop", f"{w}x{h}+{x}+{y}"]
+        argv.append(str(out))
+        p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            raise SessionError(f"capture failed: {p.stderr.strip()[:300]}")
+        result = {
+            "path": str(out),
+            "geometry": s.geometry,
+            "observed": s.geometry,
+            "complete": True,
+        }
     s.last_verb = "screenshot"
     save(s)
-    return out
+    return result
 
 
 def describe(s: Session) -> dict[str, Any]:

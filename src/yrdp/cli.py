@@ -164,10 +164,16 @@ def cmd_open(args: argparse.Namespace) -> int:
     # Recall is not a flag and not optional: a skill an agent must remember to
     # load is a skill an agent forgets, so opening a session prints the lore.
     lore.recall(t.name)
+    where = f"on {s.display}" if s.display else f"direct to {s.host}"
+    drift = (
+        "" if not s.server_geometry or s.server_geometry == s.geometry
+        else f" ⚠ the far end is actually {s.server_geometry}"
+    )
     return _emit(
         session.describe(s),
-        f"{t.name}: {s.protocol} surface on {s.display} pinned at {s.geometry}"
-        + ("" if s.window_found else " (client alive, nothing mapped yet — screenshot it)"),
+        f"{t.name}: {s.protocol} surface {where} pinned at {s.geometry}"
+        + ("" if s.window_found else " (client alive, nothing mapped yet — screenshot it)")
+        + drift,
     )
 
 
@@ -191,10 +197,12 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
         if len(parts) != 4:
             raise SystemExit(f"[{PROG}] --rect wants x,y,w,h")
         rect = tuple(parts)  # type: ignore[assignment]
-    out = session.screenshot(s, Path(args.out).expanduser(), rect=rect)
+    shot = session.screenshot(s, Path(args.out).expanduser(), rect=rect)
+    drift = "" if shot["observed"] == shot["geometry"] else f" ⚠ far end is {shot['observed']}"
+    partial = "" if shot["complete"] else " ⚠ PARTIAL frame — not every rectangle arrived"
     return _emit(
-        {"path": str(out), "geometry": s.geometry, "rect": args.rect},
-        f"{args.target}: {'crop' if rect else 'full surface'} -> {out}",
+        {**shot, "rect": args.rect},
+        f"{args.target}: {'crop' if rect else 'full surface'} -> {shot['path']}{drift}{partial}",
     )
 
 
@@ -210,8 +218,8 @@ def cmd_do(args: argparse.Namespace) -> int:
         session.type_text(s, args.text or "")
         did = "type"
     else:
-        session.key(s, args.text or "")
-        did = f"key {args.text}"
+        session.key(s, args.text or "", hold_ms=args.hold_ms)
+        did = f"key {args.text}" + (f" held {args.hold_ms}ms" if args.hold_ms else "")
     return _emit({"target": args.target, "did": did, "geometry": s.geometry}, f"{args.target}: {did}")
 
 
@@ -344,6 +352,14 @@ def build_parser() -> argparse.ArgumentParser:
     do.add_argument("text", nargs="?", help="text to type, or a chord like ctrl+shift+o")
     do.add_argument("--at", help="X,Y on the pinned surface")
     do.add_argument("--button", type=int, default=1)
+    do.add_argument(
+        "--hold-ms",
+        type=int,
+        default=0,
+        help="hold a key down this long before releasing it. Firmware and boot "
+        "pickers poll slowly and can miss a press released within a frame — which "
+        "looks exactly like keys not arriving at all.",
+    )
     do.add_argument(
         "--proven",
         help="the geometry this coordinate was proven at (from lore). A mismatch is "

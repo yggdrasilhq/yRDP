@@ -66,9 +66,12 @@ Enforced at the point of action, in three places:
 
 - the shadow surface is created at exactly the declared size, so nothing downstream can
   renegotiate it;
-- the resize-granting flags of whichever protocol is in use are never passed — RDP's
-  `dynamic-resolution` and `smart-sizing`, VNC's `RemoteResize=1`. Each adapter NAMES its
-  own in `clients.py` and they are locked out by test, not merely left off;
+- whatever would let the far end resize us is never offered, and is NAMED so a test can
+  assert its absence rather than trusting that it was left off. For a spawned client that
+  is a flag list (RDP's `dynamic-resolution`, `smart-sizing`) in `clients.py`; for a
+  protocol we speak ourselves it is the pseudo-encodings we never advertise
+  (`rfb.FORBIDDEN_ENCODINGS`: `DesktopSize`, `ExtendedDesktopSize`) — a server can only
+  resize a client that said it would listen;
 - a coordinate replayed from another geometry is refused, and a coordinate off the surface
   is refused too, because off-surface is a rotted coordinate rather than a near miss.
 
@@ -102,11 +105,34 @@ agent (any host)                          human (any number of them)
    │ yrdp <verb> --target X                  │ yrdp view --target X
    ▼                                         ▼
         ONE canonical surface — fixed dimensions, pinned by contract
-        └── RDP or VNC client on a headless display
-              capture: screenshot / crop      reveal: shared VNC export
-              input:   click / type / key             + websocket bridge
-                                                      + OSC 7717 web-surface
+        ├── rdp: a client binary on a headless display we created   [backend: x11]
+        │        capture: ImageMagick   input: xdotool
+        └── vnc: the protocol spoken directly, nothing in between   [backend: rfb]
+                 capture: framebuffer   input: RFB key/pointer events
+                                                 reveal: shared VNC export
+                                                       + websocket bridge
+                                                       + OSC 7717 web-surface
 ```
+
+**Two backends, one seam** (`clients.Adapter.backend`). Everything above it — the geometry
+contract, session records, viewers, lore, hooks, credential resolution, the verb set — is
+shared, which is why this is still one tool rather than two.
+
+VNC took the x11 route first and it did not work: the viewer authenticated, painted nothing
+headless, and wedged other X clients on the display. The reveal path had already shown the
+fix, because a `yrdp view` of a VNC target bridges the endpoint straight through with no X
+in the path. Applying the same move to the agent lane **deleted** the spawned-viewer path
+rather than adding a mode beside it — a framebuffer protocol needs no framebuffer emulator,
+and a broken second way to hold one surface is worse than none.
+
+That difference in shape follows a difference in the far end, not a preference:
+
+- an **RDP session is stateful on the far end** — a logon session that ends when its client
+  leaves — so a client process must stay alive for as long as the session does;
+- a **VNC console is a view onto a framebuffer that exists regardless**, so each verb opens
+  its own short connection and closes it. No display, no client process, nothing to
+  supervise and nothing to leak. `alive()` therefore asks the endpoint rather than a pid,
+  because reporting pid-liveness for a backend with no pids would be a comforting lie.
 
 - **The agent lane never needs a display of its own**, so unattended operation costs the
   desktop machine nothing.
@@ -177,23 +203,45 @@ codebase, because everything that matters — the geometry contract, sessions, v
 hooks, credentials, the verb set — is protocol-independent. Two copies of one idea drift,
 always in the direction that costs a debugging session.
 
-`clients.py` is the single protocol-shaped seam, and an adapter owes four things: pin the
-surface to the contract geometry; **name** the flags that would let the far end resize us so
-they can be locked out by test (TigerVNC's `RemoteResize=1` is the exact analogue of RDP's
-`dynamic-resolution`); deliver the secret off argv; and classify failures into the **same
-named outcomes**, because the caller's recovery depends on the outcome and must never
-depend on the protocol.
+`clients.py` is the single protocol-shaped seam, and a protocol owes four things in
+whichever form its backend expresses them: pin the surface to the contract geometry;
+**name** whatever would let the far end resize us so it can be locked out by test (RDP's
+`dynamic-resolution` flag; the `DesktopSize` pseudo-encoding we never advertise); deliver
+the secret by a channel `ps` cannot read; and classify failures into the **same named
+outcomes**, because the caller's recovery depends on the outcome and must never depend on
+the protocol. The x11 backend earns those outcomes by matching a client's stderr; the rfb
+backend raises them as `RfbAuthError` / `RfbError` — the same contract with fewer spellings
+to get wrong.
+
+`rfb.py` is deliberately small: Raw encoding only, one pixel format, no compression, no
+cursor pseudo-encodings. A screenshot of a pinned surface and a handful of input events
+need no more, and an encoding that is never implemented is one that cannot arrive
+malformed. VNC's original password security type needs DES, which is why `vncauth.py`
+exists and why nothing else may import it.
 
 ## 9. Status
 
-**Built and proven on real hardware:** the shadow surface end to end — reachability, the
-client connecting at a pinned geometry, a real authentication verdict in about two seconds,
-a captured desktop at exactly the contract size, and nothing leaked when an open fails.
-Plus the substrate seam, `exec`, and lore recall on open.
+**Proven on real hardware, by running it rather than by reading it.**
 
-**Designed, not built:** the **viewport surface**. A target that asks for it is refused with
-a message saying so, because silently handing back a headless shadow instead would be a lie
-about which product you are using.
+- **RDP, x11 backend** — reachability, a client connecting at a pinned geometry, a real
+  authentication verdict in about two seconds, a captured desktop at exactly the contract
+  size, a coordinate stamped at another geometry refused against a live session, and
+  nothing left behind when an open fails. Plus the substrate seam, `exec`, and lore recall.
+- **The reveal** — one session, several viewers, none evicting another; the session still
+  alive and painting after every viewer detached. For a VNC target the bridge points
+  straight at the endpoint, with no export in the middle.
+- **VNC, rfb backend** — the handshake (3.8, and 3.3/3.7 by version fallback), security type
+  None and the DES password type, a framebuffer decoded and written as a PNG, and key and
+  pointer events landing in the far end. Proven twice over: against a local x11vnc that
+  really did refuse a wrong password and really did accept the right one, and against a
+  hypervisor console where the picture read back matched what was painted and arrow keys
+  visibly moved the selection.
 
-**Next:** the viewport surface as a first-class libyggterm surface; a click-grid bootstrap
-for rung 5; and a session lease so long agent flows are not reaped mid-way.
+**Not built:**
+
+- **A native libyggterm surface** for the reveal — the framebuffer composited directly, no
+  browser and no VNC hop. Better endgame, yggterm-side work.
+- **The accessibility rung (3)** for any platform.
+- **A session lease**, so a long agent flow is not reaped mid-way.
+- **Apple's own VNC security type**, which is what a macOS Screen Sharing endpoint asks
+  for. The direct client names it in its refusal rather than failing vaguely.

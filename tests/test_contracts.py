@@ -11,13 +11,14 @@ import base64
 import shlex
 import sys
 import textwrap
+import zlib
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from yrdp import clients, config, session, view  # noqa: E402
+from yrdp import clients, config, rfb, session, view  # noqa: E402
 from yrdp.geometry import (  # noqa: E402
     Geometry,
     GeometryError,
@@ -346,8 +347,14 @@ def test_detaching_a_viewer_leaves_the_session_running():
 # -- one tool, two protocols ------------------------------------------------
 
 
-def test_the_vnc_adapter_pins_the_surface_and_refuses_remote_resize(targets):
-    """RemoteResize=1 is TigerVNC's exact analogue of RDP's dynamic-resolution."""
+def test_vnc_is_spoken_directly_and_has_no_client_argv(targets):
+    """The VNC lane must never grow a spawned-viewer path again.
+
+    It had one: a headless X display with a real viewer inside it.  The viewer
+    authenticated and then painted nothing, while wedging other X clients on the
+    display.  If someone re-adds an argv here, this goes red — the point is not
+    that argv is bad, it is that two ways to hold one surface will diverge.
+    """
     _write(targets, "v9.toml", """
         [target]
         name = "v9"
@@ -360,20 +367,92 @@ def test_the_vnc_adapter_pins_the_surface_and_refuses_remote_resize(targets):
     """)
     t = config.load_target("v9")
     assert t.connection.port == 5900, "the default port must follow the protocol"
-    argv = clients.connection_argv(t)
-    joined = " ".join(argv)
-    assert "-RemoteResize=0" in argv, "a viewer must never resize the remote desktop"
-    assert "1440x900" in joined, "the surface must be pinned to the contract"
-    for flag in clients.VNC.forbidden:
-        assert flag not in joined
+    assert clients.VNC.backend == clients.BACKEND_RFB
+    assert clients.VNC.binary == "", "a directly-spoken protocol spawns nothing"
+    with pytest.raises(ValueError, match="spoken directly"):
+        clients.connection_argv(t)
+
+
+def test_the_direct_client_never_advertises_a_resize_pseudo_encoding():
+    """The geometry contract, in protocol form.
+
+    A server can only resize a client that said it would listen.  Advertising
+    DesktopSize is the exact analogue of passing RDP's ``dynamic-resolution``,
+    and it would rot every coordinate in the lore without raising anything.
+    """
+    assert rfb.FORBIDDEN_ENCODINGS, "the forbidden set must name what it forbids"
+    for code in rfb.ADVERTISED_ENCODINGS:
+        assert code not in rfb.FORBIDDEN_ENCODINGS, (
+            f"encoding {code} ({rfb.FORBIDDEN_ENCODINGS.get(code)}) hands the far end "
+            f"control of our surface size"
+        )
+    assert rfb.ENCODING_RAW in rfb.ADVERTISED_ENCODINGS
 
 
 def test_both_protocols_classify_into_the_same_named_outcomes():
-    """The caller's recovery depends on the outcome, never on the protocol."""
-    for adapter in (clients.RDP, clients.VNC):
-        assert adapter.auth_markers, f"{adapter.binary} must be able to say 'wrong password'"
-        assert adapter.unreachable_markers, f"{adapter.binary} must be able to say 'no answer'"
-        assert adapter.forbidden, f"{adapter.binary} must name its resize-granting flags"
+    """The caller's recovery depends on the outcome, never on the protocol.
+
+    The x11 backend earns the two outcomes by matching a client's stderr; the
+    direct backend raises them as types.  Both must arrive at the SAME pair, or
+    a caller has to ask which protocol it is before it can recover.
+    """
+    assert clients.RDP.auth_markers, "a spawned client must be able to say 'wrong password'"
+    assert clients.RDP.unreachable_markers, "a spawned client must be able to say 'no answer'"
+    assert clients.RDP.forbidden, "a spawned client must name its resize-granting flags"
+
+    with pytest.raises(session.AuthRefused):
+        with session._rfb_errors("open"):
+            raise rfb.RfbAuthError("refused")
+    with pytest.raises(session.SessionError):
+        with session._rfb_errors("open"):
+            raise rfb.RfbError("nobody home")
+
+
+def test_a_session_with_no_processes_never_signals_the_process_group():
+    """``kill(0, sig)`` means 'my whole process group' — including the tool.
+
+    Every rfb session records pid 0 twice, so a single unguarded ``os.kill``
+    here would have taken down the caller's shell.
+    """
+    assert session._alive(0) is False
+    killed = []
+    original = session.os.kill
+    session.os.kill = lambda pid, sig: killed.append(pid)
+    try:
+        session._kill(0)
+        session._kill(-1)
+    finally:
+        session.os.kill = original
+    assert killed == [], f"refused pids leaked to kill(): {killed}"
+
+
+def test_a_chord_keeps_one_vocabulary_across_both_backends():
+    """``yrdp do key ctrl+alt+Delete`` must mean one thing, not two."""
+    mods, key = rfb.parse_chord("ctrl+alt+Delete")
+    assert [hex(m) for m in mods] == ["0xffe3", "0xffe9"]
+    assert key == 0xFFFF
+    assert rfb.parse_chord("Return") == ([], 0xFF0D)
+    assert rfb.parse_chord("a") == ([], ord("a"))
+    assert rfb.parse_chord("ctrl++") == ([0xFFE3], ord("+"))
+    with pytest.raises(rfb.RfbError, match="unknown key"):
+        rfb.parse_chord("Warp")
+
+
+def test_a_frame_refuses_a_crop_that_is_not_inside_it():
+    """A crop off the surface is a rotted coordinate, not a near miss."""
+    frame = rfb.Frame(4, 2, bytearray(4 * 2 * 4))
+    assert frame.crop(1, 0, 2, 2).width == 2
+    with pytest.raises(rfb.RfbError, match="refusing crop"):
+        frame.crop(3, 0, 2, 2)
+
+
+def test_a_frame_writes_the_pixels_it_was_given():
+    """BGRX in, RGB out — a channel swap here would mis-report every colour."""
+    pixels = bytearray([0, 0, 255, 0, 255, 0, 0, 0])  # red, then blue
+    png = rfb.Frame(2, 1, pixels).png()
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    body = zlib.decompress(png[png.index(b"IDAT") + 4:][: -12])
+    assert bytes(body) == bytes([0, 255, 0, 0, 0, 0, 255])  # filter, RGB, RGB
 
 
 def test_an_unknown_protocol_is_refused_not_defaulted(targets):
