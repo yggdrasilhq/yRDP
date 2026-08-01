@@ -82,12 +82,38 @@ class Target:
     geometry: Geometry
     kind: str = "rdp"
     description: str = ""
+    #: What MACHINE this target lives on, for humans.  Several targets routinely
+    #: share one box — an operator's Windows guest can carry a trading client and
+    #: an astrology suite, and each gets its own target because each has its own
+    #: hooks and its own lore.  That is right for the agent lane and WRONG for a
+    #: chooser: a human picking "which desktop do I want" is picking a MACHINE,
+    #: and offering them two rows that open the same guest is a category error.
+    #: Empty ⇒ the endpoint is the identity (see `machine_key`).
+    machine: str = ""
     connection: Connection | None = None
     #: argv prefix that runs a command on the machine hosting the target.
     #: Whatever gets a shell there — ssh, a container attach, anything.
     host_shell: tuple[str, ...] = ()
     hooks: dict[str, tuple[str, ...]] = field(default_factory=dict)
     source: Path | None = None
+
+    @property
+    def machine_key(self) -> tuple[str, str, int]:
+        """What makes two targets THE SAME BOX: the endpoint they dial.
+
+        Not the declared name, which is per-application, and not the geometry,
+        which two targets on one machine can (wrongly) disagree about.
+        """
+        c = self.connection
+        return (c.protocol, c.host, c.port) if c else ("", self.name, 0)
+
+    @property
+    def machine_label(self) -> str:
+        """What to call the machine in a chooser."""
+        if self.machine.strip():
+            return self.machine.strip()
+        c = self.connection
+        return f"{c.host}:{c.port}" if c else self.name
 
     def hook(self, name: str) -> tuple[str, ...]:
         if name not in self.hooks:
@@ -184,6 +210,7 @@ def from_toml(name: str, raw: dict, path: Path | None = None) -> Target:
         name=str(t.get("name", name)),
         kind=str(t.get("kind", "rdp")),
         description=str(t.get("description", "")),
+        machine=str(t.get("machine", "")),
         geometry=geometry,
         connection=connection,
         host_shell=tuple(str(x) for x in (raw.get("host") or {}).get("shell", ())),

@@ -41,6 +41,10 @@ from . import config as config_mod
 from . import session as sessions
 from . import view
 
+#: Chooser state the APP owns. The GUI holds the live draft while the user
+#: types and posts it on the search action; this is where it settles.
+_STATE = {"query": ""}
+
 #: The viewport pane id — the chooser proper.
 PANE = "targets"
 
@@ -100,61 +104,103 @@ def _state_of(name: str) -> tuple[str, str]:
     return "", f"not running · will start it · {where}"
 
 
-def _schema() -> dict:
-    """The chooser, in the pane vocabulary yggterm already renders.
+def _machines() -> list[tuple[str, list]]:
+    """Targets grouped into the MACHINES a human is actually choosing between.
 
-    `row_action` (not a trailing button) is what makes the whole row the target:
-    the operator said "I click one, and go to the session", and a row you must
-    hit a small button on is not that.
+    ⛔ THE CATEGORY ERROR THIS FIXES. `tws` and `pl9` are two targets on ONE
+    Windows guest — same protocol, same host, same port. Two targets is correct
+    for the agent lane (each carries its own hooks, its own lore, its own
+    ladder rungs), and it is wrong here: offering a human two rows that open the
+    same desktop, described by the APPLICATION that happens to run on it, tells
+    them nothing about what they are picking and is inaccurate the moment a
+    third app is installed.
+
+    So the chooser groups by `machine_key` — the endpoint, which is what makes
+    two targets the same box — and names the group by `machine_label`.
     """
-    rows: list[dict] = []
+    groups: dict[tuple, list] = {}
     for name in config_mod.list_targets():
         try:
             t = config_mod.load_target(name)
-            title = t.description or name
-            icon = "🖥"
         except config_mod.ConfigError:
-            title, icon = name, "⚠"
-        status, subtitle = _state_of(name)
+            continue
+        groups.setdefault(t.machine_key, []).append(t)
+    out = []
+    for key, targets in groups.items():
+        targets.sort(key=lambda t: t.name)
+        out.append((targets[0].machine_label, targets))
+    out.sort(key=lambda pair: pair[0].lower())
+    return out
+
+
+def _pick_target(targets: list):
+    """Which target speaks for the machine when the human clicks it.
+
+    A live session wins — connecting to a box that already has one must attach
+    to THAT session rather than force a second at another contract.
+    """
+    for t in targets:
+        live = sessions.load(t.name)
+        if live is not None and live.alive():
+            return t
+    return targets[0]
+
+
+def _schema() -> dict:
+    """The chooser: a heading, a filter, and one row per MACHINE."""
+    query = _STATE["query"].strip().lower()
+    rows: list[dict] = []
+    shown = 0
+    for label, targets in _machines():
+        chosen = _pick_target(targets)
+        apps = ", ".join(t.name for t in targets)
+        haystack = f"{label} {apps}".lower()
+        if query and query not in haystack:
+            continue
+        shown += 1
+        status, state_text = _state_of(chosen.name)
         rows.append(
             {
                 "kind": "list-row",
-                "id": name,
-                "title": title,
-                "subtitle": subtitle,
-                "icon": icon,
+                "id": chosen.name,
+                "title": label,
+                # The apps ON the machine belong in the subtitle as context, not
+                # in the title as identity.
+                "subtitle": f"{state_text}  ·  {apps}",
+                "icon": "🖥",
                 "status": status,
-                # Clicking anywhere on the row connects. The explicit action
-                # button stays for discoverability and for a pointer that has
-                # not learned the row is live.
-                "row_action": f"connect:{name}",
+                "row_action": f"connect:{chosen.name}",
                 "actions": [
-                    {"action": f"connect:{name}", "label": "Connect", "title": f"Attach {name}"}
+                    {"action": f"connect:{chosen.name}", "label": "Connect",
+                     "title": f"Attach {label}"}
                 ],
             }
         )
 
     if not rows:
-        rows.append(
-            {
-                "kind": "label",
-                "text": (
-                    "No targets configured. yRDP ships none and guesses no paths — "
-                    "point YRDP_TARGETS_DIR at a store of *.toml target files."
-                ),
-                "muted": True,
-            }
-        )
+        rows.append({
+            "kind": "label",
+            "muted": True,
+            "text": (f"No machine matches {_STATE['query']!r}." if query else
+                     "No targets configured. yRDP ships none and guesses no paths — "
+                     "point YRDP_TARGETS_DIR at a store of *.toml target files."),
+        })
 
+    total = len(_machines())
     return {
         "title": "yRDP",
-        "widgets": [{"kind": "section", "text": "Remote desktops"}, *rows],
+        "widgets": [
+            # A markdown heading rather than a `section`: `section` is a small
+            # all-caps group label sized for a 300px rail, and this is a document.
+            {"kind": "markdown", "id": "hdr", "source": "# Remote desktops"},
+            {"kind": "search-box", "id": "q", "action": "search",
+             "placeholder": "Search machines…", "value": _STATE["query"]},
+            *rows,
+        ],
         "footer": [
-            {
-                "kind": "label",
-                "text": f"{len(config_mod.list_targets())} target(s) · {config_mod.targets_dir()}",
-                "muted": True,
-            }
+            {"kind": "label", "muted": True,
+             "text": (f"{shown} of {total} machine(s)" if query else f"{total} machine(s)")
+                     + f"  ·  {config_mod.targets_dir()}"},
         ],
     }
 
@@ -220,6 +266,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         action = str(body.get("action") or "")
+        values = body.get("values") or {}
+
+        if action == "search":
+            # The search box posts the draft; re-render filtered. No connect.
+            _STATE["query"] = str(values.get("q") or "")
+            self._reply({"schema": _schema()})
+            return
+
         if not action.startswith("connect:"):
             self._reply({"toast": f"yRDP does not know the action {action!r}"})
             return
