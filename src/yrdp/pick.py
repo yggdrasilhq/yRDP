@@ -35,15 +35,29 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import config as config_mod
-from . import session as sessions
-from . import view
+
+# ⚠ `session` and `view` are imported LAZILY, inside the functions that need
+# them. They drag in subprocess, the RFB client and the viewer machinery — about
+# half of this program's import cost — and the chooser needs none of it until a
+# row is actually clicked. Startup is the whole user-visible cost of a chooser:
+# the operator's report was "a slow startup to the libyggterm list (terminal
+# starts instantly with yrdp)", and 500ms of that was import time.
 
 #: Chooser state the APP owns. The GUI holds the live draft while the user
 #: types and posts it on the search action; this is where it settles.
 _STATE = {"query": ""}
+
+#: A TCP connect on a LAN or a loopback tunnel answers in single-digit ms; the
+#: only thing a longer timeout buys is a longer stall on a guest that is OFF.
+_PROBE_TIMEOUT = 0.4
+
+#: Reachability is re-probed at most this often. The chooser is rebuilt on every
+#: schema fetch AND on every liveness ping, so an uncached probe means dialling
+#: every guest several times a second.
+_PROBE_TTL = 5.0
+_PROBE_CACHE: dict[str, tuple[float, str, str]] = {}
 
 #: The viewport pane id — the chooser proper.
 PANE = "targets"
@@ -74,6 +88,15 @@ class _Choice:
 
 
 def _state_of(name: str) -> tuple[str, str]:
+    hit = _PROBE_CACHE.get(name)
+    if hit is not None and (time.monotonic() - hit[0]) < _PROBE_TTL:
+        return hit[1], hit[2]
+    status, text = _state_of_uncached(name)
+    _PROBE_CACHE[name] = (time.monotonic(), status, text)
+    return status, text
+
+
+def _state_of_uncached(name: str) -> tuple[str, str]:
     """(status dot class, human sublabel) for one target, cheaply.
 
     Deliberately shallow: this runs on every schema fetch, and a chooser that
@@ -88,13 +111,15 @@ def _state_of(name: str) -> tuple[str, str]:
     except config_mod.ConfigError as exc:
         return "", f"misconfigured — {exc}"
 
+    from . import session as sessions
+
     live = sessions.load(name)
     if live is not None and live.alive():
         # A live session is the strongest possible statement about this target,
         # and it is free to check (a pid probe), so it outranks a port probe.
         return "durable", f"connected · {live.geometry} · {t.connection.protocol.upper()}"
 
-    up = sessions.reachable(t, timeout=1.0)
+    up = sessions.reachable(t, timeout=_PROBE_TIMEOUT)
     where = f"{t.connection.host}:{t.connection.port}"
     if up:
         return "transient", f"ready · {t.geometry.stamp} · {where}"
@@ -139,6 +164,8 @@ def _pick_target(targets: list):
     A live session wins — connecting to a box that already has one must attach
     to THAT session rather than force a second at another contract.
     """
+    from . import session as sessions
+
     for t in targets:
         live = sessions.load(t.name)
         if live is not None and live.alive():
@@ -222,86 +249,138 @@ def _document_version() -> str:
     return hashlib.sha256(json.dumps(_schema(), sort_keys=True).encode()).hexdigest()[:16]
 
 
-class _Handler(BaseHTTPRequestHandler):
-    """The control endpoint. Three routes, and the GUI drives all of them."""
+def _declare_now(payload: dict) -> None:
+    """Emit a declare without stamping it first.
 
-    chosen: _Choice | None = None
-    lock = threading.Lock()
+    The stamp costs a whole schema build, and the FIRST declare is the one the
+    operator is waiting on — it is what makes the list appear at all. Stamping
+    before announcing put the schema build on the critical path for no benefit:
+    the GUI fetches the pane straight after, and that fetch is what needs to be
+    current, not the announcement.
+    """
+    _osc("sidebar", "declare", payload)
 
-    def log_message(self, *_args) -> None:  # noqa: D102 - silence stderr access logs
-        return
 
-    def _reply(self, body: dict, code: int = 200) -> None:
-        blob = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(blob)))
-        self.end_headers()
-        self.wfile.write(blob)
+#: Routes the GUI drives. Three of them, all tiny JSON — which is exactly why
+#: this is hand-rolled rather than `http.server`.
+#:
+#: ⛔ `import http.server` COSTS ~240ms on this interpreter, measured, and it was
+#: the single largest component of the chooser's startup — larger than every
+#: other import combined and larger than the interpreter itself. The operator's
+#: report was "a slow startup to the libyggterm list (terminal starts instantly
+#: with yrdp)", and a stdlib import for three routes was most of it. yggterm's
+#: own side of this channel is hand-rolled over a raw socket for the same reason
+#: ("no HTTP client dependency for one GET"); this matches it.
+_CHOSEN: _Choice | None = None
+_LOCK = threading.Lock()
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
-        path = self.path.split("?", 1)[0]
-        if path == "/ping":
-            # Endpoint-ping liveness: answering IS the liveness signal, and the
-            # stamp tells the GUI whether to refetch the pane. It moves every
-            # tick on purpose — a target's reachability is exactly the kind of
-            # thing that changes without anyone touching this process, and a
-            # chooser showing a stale "not running" is worse than a refetch.
-            self._reply({"app_name": "yRDP", "document_version": _document_version()})
-        elif path in (f"/pane/{PANE}", f"/pane/{RAIL_PANE}"):
-            # One list, two placements — the schema does not depend on which.
-            self._reply(_schema())
-        else:
-            self._reply({"error": "no such route"}, 404)
 
-    def do_POST(self) -> None:  # noqa: N802
-        if self.path.split("?", 1)[0] != "/action":
-            self._reply({"error": "no such route"}, 404)
+def _respond(conn: socket.socket, body: dict, code: int = 200) -> None:
+    blob = json.dumps(body).encode()
+    head = (
+        f"HTTP/1.1 {code} {'OK' if code == 200 else 'Not Found'}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(blob)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode()
+    try:
+        conn.sendall(head + blob)
+    except OSError:
+        pass  # the GUI hung up; nothing here is worth a traceback
+
+
+def _handle(conn: socket.socket) -> None:
+    """One request, one connection. `Connection: close` keeps this honest —
+    no keep-alive means no half-read request wedging a worker."""
+    global _CHOSEN
+    try:
+        conn.settimeout(10)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 1 << 20:
+                return
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        method, _, target = lines[0].partition(" ")
+        path = target.split(" ")[0].split("?", 1)[0]
+
+        if method == "GET" and path == "/ping":
+            # Answering IS the liveness signal. The stamp tells the GUI whether
+            # to refetch the pane, so it must be over CONTENT, never a clock.
+            _respond(conn, {"app_name": "yRDP", "document_version": _document_version()})
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        if method == "GET" and path in (f"/pane/{PANE}", f"/pane/{RAIL_PANE}"):
+            _respond(conn, _schema())
+            return
+        if method != "POST" or path != "/action":
+            _respond(conn, {"error": "no such route"}, 404)
+            return
+
+        length = 0
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            if name.strip().lower() == "content-length":
+                length = int(value.strip() or 0)
+        body_bytes = rest
+        while len(body_bytes) < length:
+            chunk = conn.recv(min(65536, length - len(body_bytes)))
+            if not chunk:
+                break
+            body_bytes += chunk
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(body_bytes or b"{}")
         except ValueError:
-            self._reply({"error": "unparseable action"}, 400)
+            _respond(conn, {"error": "unparseable action"}, 400)
             return
 
         action = str(body.get("action") or "")
         values = body.get("values") or {}
 
         if action == "search":
-            # The search box posts the draft; re-render filtered. No connect.
             _STATE["query"] = str(values.get("q") or "")
-            self._reply({"schema": _schema()})
+            _respond(conn, {"schema": _schema()})
             return
 
         if not action.startswith("connect:"):
-            self._reply({"toast": f"yRDP does not know the action {action!r}"})
+            _respond(conn, {"toast": f"yRDP does not know the action {action!r}"})
             return
 
         name = action.split(":", 1)[1]
-        with _Handler.lock:
-            _Handler.chosen = _Choice(target=name)
-        # Answer immediately with a schema that says what is happening. The
-        # connect itself can take a minute (a cold guest runs its `up` hook),
-        # and an HTTP handler that blocks that long would hold the GUI's fetch
-        # thread and read as a hung chooser.
-        self._reply(
-            {
-                "toast": f"yRDP: connecting to {name}…",
-                "schema": {
-                    "title": "yRDP",
-                    "widgets": [
-                        {"kind": "section", "text": "Connecting"},
-                        {"kind": "label", "text": f"Attaching {name}…", "muted": False},
-                        {
-                            "kind": "label",
-                            "text": "A guest that is not running is started first; that can take a minute.",
-                            "muted": True,
-                        },
-                    ],
-                },
-            }
-        )
+        with _LOCK:
+            _CHOSEN = _Choice(target=name)
+        # Answer at once. A cold guest runs its `up` hook, which can take a
+        # minute, and an HTTP handler that blocks that long holds the GUI's
+        # fetch thread and reads as a hung chooser.
+        _respond(conn, {
+            "toast": f"yRDP: connecting to {name}…",
+            "schema": {
+                "title": "yRDP",
+                "widgets": [
+                    {"kind": "markdown", "id": "hdr", "source": "# Connecting"},
+                    {"kind": "label", "text": f"Attaching {name}…"},
+                    {"kind": "label", "muted": True,
+                     "text": "A guest that is not running is started first; that can take a minute."},
+                ],
+            },
+        })
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _serve(sock: socket.socket) -> None:
+    while True:
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            return
+        threading.Thread(target=_handle, args=(conn,), daemon=True).start()
 
 
 def _free_port() -> int:
@@ -318,6 +397,8 @@ def run(*, quality: int, compression: int) -> int:
     surface — so the row the operator launched from is the row the desktop
     appears in, which is what "I click one, and go to the session" means.
     """
+    from . import view
+
     if not view.in_yggterm():
         print(
             "[yrdp] pick is a yggterm surface and there is no YGGTERM_SESSION_ID here. "
@@ -326,22 +407,23 @@ def run(*, quality: int, compression: int) -> int:
         )
         return 2
 
-    port = _free_port()
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(16)
+    port = sock.getsockname()[1]
     control = f"http://127.0.0.1:{port}"
-    # THREADING, not the plain HTTPServer. The GUI pings liveness every ~2.5s
-    # AND fetches the pane schema; a single-threaded server serialises them
-    # behind whichever connection the client holds open, which presents as a
-    # chooser that declares itself and then hangs.
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=_serve, args=(sock,), daemon=True).start()
 
     session_id = os.environ.get("YGGTERM_SESSION_ID", "")
     declare = {
         "session": session_id,
         "control": control,
         "app_name": "yRDP",
-        # The GUI refetches the viewport pane only when this moves.
-        "document_version": _document_version(),
+        # A cheap placeholder, NOT a real stamp. The real one is computed on the
+        # first loop pass; putting a schema build ahead of the first announcement
+        # delays the only thing the operator is waiting for.
+        "document_version": "boot",
         "panes": [
             # TWO placements on purpose. The viewport pane is the chooser the
             # operator asked for; the rail pane is the same list as a right-hand
@@ -354,7 +436,7 @@ def run(*, quality: int, compression: int) -> int:
             {"id": RAIL_PANE, "icon": "🖥", "title": "yRDP"},
         ],
     }
-    _osc("sidebar", "declare", declare)
+    _declare_now(declare)
     print(f"[yrdp] choose a target in the viewport (control {control})", file=sys.stderr)
 
     chosen: _Choice | None = None
@@ -363,17 +445,17 @@ def run(*, quality: int, compression: int) -> int:
             time.sleep(DECLARE_SECONDS)
             declare["document_version"] = _document_version()
             _osc("sidebar", "declare", declare)
-            with _Handler.lock:
-                chosen = _Handler.chosen
+            with _LOCK:
+                chosen = _CHOSEN
     except KeyboardInterrupt:
         _osc("sidebar", "close", {"session": session_id})
-        httpd.shutdown()
+        sock.close()
         return 130
 
     # Retire the chooser BEFORE the surface opens. Leaving it declared would
     # leave a viewport pane competing with the desktop we are about to reveal.
     _osc("sidebar", "close", {"session": session_id})
-    httpd.shutdown()
+    sock.close()
 
     from . import cli  # local: avoids a circular import at module load
 
