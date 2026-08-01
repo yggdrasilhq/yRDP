@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -264,10 +265,54 @@ def cmd_view(args: argparse.Namespace) -> int:
     attaches to whatever is already running, and detaching leaves it running.
     Several viewers may watch at once — that is co-browse, and it is the point.
     """
-    t = _target(args)
+    return reveal_target(
+        args.target,
+        read_only=args.read_only,
+        title=args.title,
+        once=args.once,
+        no_open=args.no_open,
+        password_entry=args.password_entry,
+        protocol=_protocol(args),
+        quality=getattr(args, "quality", 8),
+        compression=getattr(args, "compression", 2),
+    )
+
+
+def reveal_target(
+    name: str,
+    *,
+    read_only: bool = False,
+    title: str | None = None,
+    once: bool = False,
+    no_open: bool = False,
+    password_entry: str | None = None,
+    protocol: str | None = None,
+    quality: int = 8,
+    compression: int = 2,
+) -> int:
+    """The body of `view`, callable without an argparse Namespace.
+
+    Extracted so the CHOOSER can hand off to it (`yrdp pick` becomes the viewer
+    for whatever was picked, in the same process and therefore the same row).
+    A second copy of this logic in `pick` would be a second place for the
+    VNC-direct rule below to be got wrong.
+    """
+    t = config_mod.load_target(name)
     conn = t.connection
+
+    # Start the guest if it is not answering. The chooser's row promises "not
+    # running · will start it", and a promise the connect path cannot keep is
+    # worse than no promise: the operator clicks, nothing happens, and the
+    # reason is in a hook they never ran.
+    if "up" in t.hooks and not substrate.reachable(t):
+        print(f"[{PROG}] {name}: not answering — running its 'up' hook first", file=sys.stderr)
+        substrate.run_hook(t, "up", timeout=600.0)
+        deadline = time.monotonic() + 600.0
+        while time.monotonic() < deadline and not substrate.reachable(t):
+            time.sleep(5)
+
     direct = None
-    s = session.load(args.target)
+    s = session.load(name)
     if s is not None and not s.alive():
         s = None
     if s is None and conn is not None and conn.protocol == config_mod.PROTOCOL_VNC:
@@ -282,12 +327,10 @@ def cmd_view(args: argparse.Namespace) -> int:
             )
         lore.recall(t.name)
     elif s is None:
-        if args.no_open:
-            raise SystemExit(
-                f"[{PROG}] no live session for {args.target} and --no-open was given"
-            )
+        if no_open:
+            raise SystemExit(f"[{PROG}] no live session for {name} and --no-open was given")
         s = session.open_session(
-            t, password_entry=args.password_entry, protocol=_protocol(args), force=True
+            t, password_entry=password_entry, protocol=protocol, force=True
         )
         lore.recall(t.name)
     if not view.in_yggterm():
@@ -298,20 +341,63 @@ def cmd_view(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     viewer = view.attach(
-        s, read_only=args.read_only, title=args.title, endpoint=direct, label=t.name
+        s,
+        read_only=read_only,
+        title=title,
+        endpoint=direct,
+        label=t.name,
+        quality=quality,
+        compression=compression,
     )
     where = f"on {s.display}" if s else f"straight from {direct[0]}:{direct[1]}"
     print(
-        f"[{PROG}] {args.target}: revealed at {t.geometry.stamp} {where} "
-        f"({'read-only' if args.read_only else 'interactive'}) — {viewer.url}",
+        f"[{PROG}] {name}: revealed at {t.geometry.stamp} {where} "
+        f"({'read-only' if read_only else 'interactive'}) — {viewer.url}",
         file=sys.stderr,
     )
-    if args.once:
-        return _emit(viewer.as_dict(), f"{args.target}: surface announced once, not held")
+    if once:
+        return _emit(viewer.as_dict(), f"{name}: surface announced once, not held")
     print(f"[{PROG}] holding the surface; Ctrl-C detaches (the session keeps running)",
           file=sys.stderr)
     view.hold(s, viewer)
     return 0
+
+
+def cmd_pick(args: argparse.Namespace) -> int:
+    from . import pick
+
+    return pick.run(quality=args.quality, compression=args.compression)
+
+
+def _quality_flags(parser: argparse.ArgumentParser) -> None:
+    """Picture-quality knobs, shared by every verb that reveals a surface.
+
+    The defaults are chosen for THIS link, which is a loopback socket carried
+    over an ssh tunnel on a LAN — not the internet the VNC defaults assume.
+
+    ``--quality 9`` is the important one: below 9 the Tight encoding sends
+    photographic regions as JPEG, and a desktop is not photographic.  JPEG on
+    antialiased text produces ringing around every glyph, which reads exactly
+    like "the remote desktop is blurry" and is the single biggest quality
+    complaint on this path.  ``--compression 0`` then trades bandwidth we have
+    for CPU we would rather not spend on both ends.
+    """
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=9,
+        choices=range(0, 10),
+        metavar="0-9",
+        help="picture quality; 9 keeps text lossless (default: 9)",
+    )
+    parser.add_argument(
+        "--compression",
+        type=int,
+        default=0,
+        choices=range(0, 10),
+        metavar="0-9",
+        help="wire compression; 0 spends bandwidth to save latency (default: 0)",
+    )
 
 
 def cmd_lore(args: argparse.Namespace) -> int:
@@ -383,7 +469,15 @@ def build_parser() -> argparse.ArgumentParser:
     vw.add_argument("--no-open", action="store_true", help="fail if no session is already live")
     vw.add_argument("--password-entry", help="vault entry NAME, if a session must be opened")
     vw.add_argument("--vnc", action="store_true")
+    _quality_flags(vw)
     vw.set_defaults(func=cmd_view)
+
+    pk = sub.add_parser(
+        "pick",
+        help="choose a target in the viewport, then become its viewer",
+    )
+    _quality_flags(pk)
+    pk.set_defaults(func=cmd_pick)
     sub.add_parser("list", help="every recorded session").set_defaults(func=cmd_list)
     wt(sub.add_parser("close", help="end a session")).set_defaults(func=cmd_close)
 

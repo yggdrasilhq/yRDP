@@ -34,6 +34,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -106,6 +107,64 @@ def _novnc_root() -> str:
     )
 
 
+def _web_root() -> Path:
+    """Assemble the web root websockify serves: OUR client, noVNC's decoders.
+
+    We ship the page and borrow the protocol implementation.  Two reasons this is
+    a private root rather than pointing ``--web`` straight at ``/usr/share/novnc``:
+
+    * ``vnc.html`` exposes a **resizeSession** toggle.  A human who flips it turns
+      a ``--scaled`` attach into an ``--adopt`` without anyone deciding to, which
+      is precisely the silent invalidation the geometry contract exists to
+      prevent.  Our page never advertises the pseudo-encoding at all.
+    * ``/usr/share/novnc`` is root-owned, so the page cannot simply be dropped
+      beside the decoders it imports — and the import is relative (``./core/…``),
+      so the page has to sit at the root's top level.
+
+    Symlinks, not copies: an apt upgrade of ``novnc`` must reach this client too,
+    and a stale vendored decoder set against a live protocol is the kind of bug
+    that shows up as one broken encoding months later.
+    """
+    upstream = Path(_novnc_root())
+    root = _yggterm_home() / "yrdp" / "web"
+    root.mkdir(parents=True, exist_ok=True)
+
+    for name in ("core", "vendor"):
+        link = root / name
+        target = upstream / name
+        if not target.exists():
+            continue
+        # Repoint rather than trust: the upstream path can move between distro
+        # versions, and a dangling symlink here fails as a blank page with a
+        # module-resolution error in a console nobody is reading.
+        if link.is_symlink() and link.readlink() == target:
+            continue
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+
+    page = Path(__file__).with_name("webclient") / "index.html"
+    installed = root / "index.html"
+    body = page.read_bytes()
+    # Rewrite only on change: websockify serves from disk per request, so an
+    # unconditional write would churn the mtime under a live viewer for nothing.
+    if not installed.is_file() or installed.read_bytes() != body:
+        installed.write_bytes(body)
+    return root
+
+
+def _yggterm_home() -> Path:
+    """Where yggterm keeps per-host app state, and where an app puts its own.
+
+    ``YGGTERM_HOME`` if the daemon exported one, else ``~/.yggterm`` — the same
+    resolution ``yggterm_core::resolve_yggterm_home`` performs, because a
+    libyggterm app's state belongs on the host the app RUNS on, beside every
+    other app's.
+    """
+    home = os.environ.get("YGGTERM_HOME")
+    return Path(home) if home else Path.home() / ".yggterm"
+
+
 def emit(action: str, payload: dict) -> None:
     """Announce a surface to yggterm on our own stdout."""
     blob = base64.b64encode(json.dumps(payload).encode()).decode()
@@ -118,6 +177,19 @@ def in_yggterm() -> bool:
     return bool(os.environ.get("YGGTERM_SESSION_ID"))
 
 
+def _matte_colour() -> str:
+    """The colour an unfilled viewport is matted with, without the leading '#'.
+
+    Taken from the terminal theme the daemon exports into every PTY, so the
+    viewer's letterbox is the same colour as the terminal it opened from.  A
+    surface that cannot fill the window should look like a panel inset in the
+    operator's own theme; a hardcoded grey looks like a bug in someone's
+    stylesheet.  Falls back to yggterm's default dark background.
+    """
+    raw = (os.environ.get("YGGTERM_TERMINAL_COLOR_BACKGROUND") or "").strip().lstrip("#")
+    return raw if re.fullmatch(r"[0-9a-fA-F]{6}", raw) else "262a33"
+
+
 def attach(
     s: Session | None,
     *,
@@ -125,6 +197,8 @@ def attach(
     title: str | None = None,
     endpoint: tuple[str, int] | None = None,
     label: str = "",
+    quality: int = 9,
+    compression: int = 0,
 ) -> Viewer:
     """Reveal a surface and announce it, without disturbing what is behind it.
 
@@ -143,7 +217,7 @@ def attach(
             "the reveal needs websockify on this host; install it, or use "
             "`yrdp screenshot` for a still frame"
         )
-    root = _novnc_root()
+    root = str(_web_root())
     web_port = _free_port(6100, 6200)
     pids: list[int] = []
 
@@ -165,7 +239,22 @@ def attach(
             "-nopw",           # loopback-only, and the surface is already gated
             "-shared",         # THE co-browse flag: viewers do not evict each other
             "-forever",        # the session outlives any one viewer
-            "-noxdamage",
+            # ── Smoothness. These four are why a dragged window no longer
+            # ── stutters, and the first one is a REMOVAL.
+            #
+            # `-noxdamage` used to be here and was the single biggest cost on
+            # this path: it disables the DAMAGE extension, so x11vnc stops being
+            # told which rectangles changed and falls back to POLLING THE WHOLE
+            # FRAMEBUFFER on a timer.  At the contract geometry that is a couple
+            # of megapixels re-read per tick to discover that a cursor moved.
+            # It is a workaround for drivers whose damage events lie, and Xvfb
+            # is not one of them — `xdpyinfo` on our own display lists DAMAGE,
+            # XFIXES, MIT-SHM and Composite.  Left in by inheritance, not by a
+            # measurement.
+            "-defer", "8",     # ms to coalesce updates before sending (default 30)
+            "-wait", "8",      # ms between polls when damage is quiet (default 30)
+            "-speeds", "lan",  # tune the heuristics for the link we actually have
+            "-nodpms",         # a screensaver blanking the surface is not an update
         ]
         if read_only:
             argv.append("-viewonly")
@@ -180,16 +269,38 @@ def attach(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    _await_port(web_port, bridge, "websockify")
+    try:
+        # 45 s, not 15.  The FIRST websockify on a host has to import its
+        # dependencies and stand up a `multiprocessing` forkserver before it
+        # binds, and on a loaded box that has been measured past 15 s — after
+        # which it binds anyway, unwatched.  The old timeout therefore produced
+        # the worst possible failure: a refusal naming a fact ("websockify never
+        # listened on 6100") that `ss` contradicted a second later, leaving a
+        # COMPLETE working bridge with nothing announcing it.  Warm caches make
+        # the retry instant, so this only ever bit the first view after a boot.
+        _await_port(web_port, bridge, "websockify", timeout=45.0)
+    except ViewError:
+        # Whatever we started before failing is ours to clean up.  Without this,
+        # a failed attach leaks the x11vnc it had already spawned; the next
+        # attempt then walks to the next free port and the host accumulates one
+        # orphaned exporter per try.
+        _reap_pids(pids + [bridge.pid])
+        raise
     pids.append(bridge.pid)
 
-    # resize=scale IS the contract in URL form: the viewer scales to its window
-    # and never asks the far end to change size.
-    url = (
-        f"http://127.0.0.1:{web_port}/vnc.html"
-        f"?autoconnect=1&reconnect=1&resize=scale&show_dot=1"
-        + ("&view_only=1" if read_only else "")
-    )
+    # The client scales to its window and never asks the far end to change size;
+    # `resizeSession` is not a parameter here because it is not a choice (see the
+    # comment at the top of webclient/index.html).  The matte colour is passed so
+    # an unfilled viewport reads as this operator's terminal, not as a different
+    # application's idea of grey.
+    params = [
+        f"quality={quality}",
+        f"compression={compression}",
+        f"bg={_matte_colour()}",
+    ]
+    if read_only:
+        params.append("view_only=1")
+    url = f"http://127.0.0.1:{web_port}/index.html?" + "&".join(params)
     viewer = Viewer(
         target=s.target if s else label,
         vnc_port=vnc_port,
@@ -230,6 +341,15 @@ def _clean_env(display: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in INHERITED_DESKTOP_VARS}
     env["DISPLAY"] = display
     return env
+
+
+def _reap_pids(pids: list[int]) -> None:
+    """Best-effort teardown of processes a half-built viewer already started."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, TypeError):
+            pass
 
 
 def _await_port(port: int, proc: subprocess.Popen, what: str, timeout: float = 15.0) -> None:

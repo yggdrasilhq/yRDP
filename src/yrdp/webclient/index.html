@@ -1,0 +1,180 @@
+<!doctype html>
+<!--
+  yRDP's own viewer — the HUMAN half of the dual-viewport contract.
+
+  This exists instead of noVNC's stock `vnc.html` for one structural reason and
+  several cosmetic ones. The structural one: `vnc.html` ships a control bar, a
+  settings drawer and a connect dialog, all of which can RESIZE THE SESSION.
+  `resizeSession` is a user-visible toggle there, and a human who flips it turns
+  a `--scaled` attach into an `--adopt` silently, invalidating every coordinate
+  the agent lane holds. Here the SetDesktopSize pseudo-encoding is never
+  advertised at all, so the far end cannot be resized by a viewer even in
+  principle — the geometry contract is enforced by omission, which is the only
+  way it stays enforced (docs/agent-surface-attachment.md §3).
+
+  The cosmetic ones are why the operator asked for this: stock noVNC mattes an
+  unfilled viewport in flat #313131 with a visible toolbar seam, which reads as
+  a broken render rather than a deliberate one.
+
+  Everything is driven by query parameters so that one file serves every target
+  and the Python side owns the policy.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>yRDP</title>
+<style>
+  :root {
+    /* Overridden from ?bg= so the matte matches the operator's terminal theme
+       rather than announcing itself as a different application. */
+    --matte: #262a33;
+    --edge: rgba(255, 255, 255, .06);
+  }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: var(--matte);
+    overflow: hidden;
+    /* The viewer is a viewport, not a document: no rubber-banding, no
+       accidental text selection when a drag misses the canvas. */
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    font: 13px/1.5 system-ui, sans-serif;
+    color: #9aa3b2;
+  }
+  /* THE GPU PATH. The canvas noVNC paints into is scaled with a CSS transform,
+     which WebKit promotes to a composited layer only if we ask plainly. Without
+     these the scale is redone on the CPU every frame and a 1440x1200 surface
+     visibly tears while dragging a window. */
+  #screen {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    transform: translateZ(0);
+    will-change: transform;
+    backface-visibility: hidden;
+    /* `layout paint`, NOT `strict`. `strict` also applies SIZE containment, and
+       noVNC measures this element with clientWidth/clientHeight to compute the
+       scale — containing its size is asking the thing that must be measured not
+       to report its measurements. The compositing benefit comes from `paint`. */
+    contain: layout paint;
+  }
+  #screen canvas {
+    /* Bilinear rather than nearest: a scaled desktop is a photo, not pixel art,
+       and `pixelated` makes downscaled text unreadable. */
+    image-rendering: auto;
+    transform: translateZ(0);
+  }
+  /* A hairline so the surface reads as an inset panel when it does not fill the
+     viewport, instead of floating in an undifferentiated void. */
+  #screen::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    box-shadow: inset 0 0 0 1px var(--edge);
+  }
+  #status {
+    position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    padding: .55rem .9rem;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, .35);
+    letter-spacing: .01em;
+    pointer-events: none;
+    opacity: 0; transition: opacity .18s ease;
+  }
+  #status[data-show="1"] { opacity: 1; }
+</style>
+
+<div id="screen"></div>
+<div id="status">connecting…</div>
+
+<script type="module">
+import RFB from './core/rfb.js';
+
+const q = new URLSearchParams(location.search);
+const num = (k, d) => { const v = parseInt(q.get(k), 10); return Number.isFinite(v) ? v : d; };
+
+const matte = q.get('bg');
+if (matte) document.documentElement.style.setProperty('--matte', '#' + matte.replace(/^#/, ''));
+
+const statusEl = document.getElementById('status');
+let settled = false;
+const say = (text, show) => { statusEl.textContent = text; statusEl.dataset.show = show ? '1' : '0'; };
+
+// The websockify endpoint is this same origin — the bridge serves both the
+// client and the socket, so there is no second host to get wrong.
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/websockify';
+
+let rfb = null;
+let retry = 0;
+
+function connect() {
+  rfb = new RFB(document.getElementById('screen'), wsUrl, {});
+
+  // ── The geometry contract, in three lines ────────────────────────────────
+  // scaleViewport: the viewer scales itself to whatever window it is given.
+  // resizeSession: NEVER. A viewer that renegotiates the surface has silently
+  //   converted --scaled into --adopt and invalidated the agent's coordinates.
+  // clipViewport: off, or a surface larger than the window would scroll instead
+  //   of scaling and the human would see an arbitrary crop of the agent's view.
+  rfb.scaleViewport = true;
+  rfb.resizeSession = false;
+  rfb.clipViewport = false;
+
+  rfb.qualityLevel = num('quality', 9);
+  rfb.compressionLevel = num('compression', 0);
+  rfb.showDotCursor = q.get('dot') !== '0';
+  rfb.viewOnly = q.get('view_only') === '1';
+  rfb.background = 'transparent';
+  rfb.focusOnClick = true;
+
+  rfb.addEventListener('connect', () => {
+    settled = true; retry = 0;
+    say('', false);
+    // Keyboard input goes to whichever element has focus; the surface is the
+    // only thing here, so take it as soon as there is something to type into.
+    if (!rfb.viewOnly) rfb.focus();
+  });
+
+  rfb.addEventListener('disconnect', (e) => {
+    const clean = e.detail && e.detail.clean;
+    // Exponential-ish backoff, capped: the bridge dies and restarts when a
+    // session is repinned, and hammering it during that window just fills the
+    // log with refusals.
+    retry = Math.min(retry + 1, 10);
+    const wait = Math.min(250 * retry, 2000);
+    say(clean && settled ? 'reconnecting…' : 'connecting…', true);
+    setTimeout(connect, wait);
+  });
+
+  // A console with no auth still fires this if a target ever grows one; answering
+  // with nothing is better than a blocking prompt nobody can see.
+  rfb.addEventListener('credentialsrequired', () => rfb.sendCredentials({ password: '' }));
+}
+
+say('connecting…', true);
+connect();
+
+// ── Rescale when the VIEWPORT changes, not just when the window does ────────
+// noVNC observes the container itself, but `_handleResize` early-returns when
+// the size it reads still matches the size it last recorded — and a yggterm
+// surface is resized by the HOST (collapsing the cwd tree, toggling the rail),
+// which can deliver the observation before layout has settled. The surface then
+// keeps its old scale and the new space becomes matte: exactly the "I hid my
+// cwd tree and got extra black bar padding" report.
+//
+// Re-asserting `scaleViewport` is the supported way to force the recompute —
+// its setter calls the same `_updateScale()` the internal path would. Two
+// frames, because the first can still read the pre-layout box.
+const rescale = () => {
+  if (!rfb) return;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    try { rfb.scaleViewport = true; } catch (_) { /* torn down mid-resize */ }
+  }));
+};
+new ResizeObserver(rescale).observe(document.getElementById('screen'));
+window.addEventListener('resize', rescale);
+// A surface the host hid and re-showed can come back at a different size while
+// no resize event fired at all; re-assert whenever we become visible again.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) rescale(); });
+
+// Refocus on click even after the surface has been backgrounded and rehidden by
+// the host — the webview keeps the DOM but not always the focus ring.
+window.addEventListener('mousedown', () => { if (rfb && !rfb.viewOnly) rfb.focus(); });
+</script>
