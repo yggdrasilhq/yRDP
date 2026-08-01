@@ -770,14 +770,22 @@ def test_the_daemon_knows_the_chooser_before_the_operator_can_click_it(monkeypat
     from yrdp import daemon, pick
 
     calls: list[tuple[str, str]] = []
+    panes: list[tuple[str, str]] = []
     monkeypatch.setenv("YGGTERM_SESSION_ID", "local://s1")
     monkeypatch.setattr(daemon, "ensure", lambda *a, **k: "http://127.0.0.1:1")
     monkeypatch.setattr(
         pick, "_get", lambda control, path, timeout=5.0: calls.append(("get", path)) or {}
     )
-    monkeypatch.setattr(
-        pick, "_osc", lambda verb, action, payload: calls.append(("osc", f"{verb}:{action}"))
-    )
+
+    def fake_osc(verb: str, action: str, payload: dict) -> None:
+        calls.append(("osc", f"{verb}:{action}"))
+        if (verb, action) == ("sidebar", "declare") and not panes:
+            panes.extend(
+                (pane.get("id", ""), pane.get("placement", ""))
+                for pane in payload.get("panes", [])
+            )
+
+    monkeypatch.setattr(pick, "_osc", fake_osc)
 
     def stop(_seconds):
         raise KeyboardInterrupt
@@ -797,6 +805,13 @@ def test_the_daemon_knows_the_chooser_before_the_operator_can_click_it(monkeypat
         None,
     )
     assert declared is not None, "the chooser never declared its pane"
+    assert panes == [("targets", "viewport")], (
+        "the chooser declared something other than exactly one viewport pane. A "
+        "second pane takes over a permanent piece of the operator's window — "
+        "their notifications and session metadata live in that rail — and then "
+        "shows a STALE list, because a connect reply repaints the pane that was "
+        "clicked and not its twin"
+    )
     assert registered is not None and registered < declared, (
         "the chooser was on screen and clickable before the daemon had any way "
         "to know who to answer"
