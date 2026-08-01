@@ -33,12 +33,20 @@ from urllib.parse import urlparse
 
 from . import daemon
 
-#: The viewport pane — the chooser proper — and the same list offered as a rail
-#: panel.  Both are declared: the rail is useful on its own, and a rail that
-#: renders while the viewport does not is the bisect that separates "my declare
-#: failed" from "viewport placement failed".
+#: THE ONE PANE. The chooser is a viewport document, and nothing else.
+#:
+#: It used to declare a rail panel beside it, carrying the same list — kept as a
+#: bisect (a rail that renders while the viewport does not separates "my declare
+#: failed" from "viewport placement failed"). That instrument has done its job,
+#: and what it cost is worse than what it bought: the rail took over the
+#: operator's right panel — the place their notifications and session metadata
+#: live — and then sat there showing a STALE machine list, because a connect
+#: reply repaints the pane that was clicked and not its twin. Two panes for one
+#: document is two truths, and the second one is always the older.
+#:
+#: An app that borrows a permanent piece of someone's window has to earn it.
+#: yRDP does not: it is a chooser you open, use once, and hand back.
 PANE = "targets"
-RAIL_PANE = "targets-rail"
 
 #: Re-declare cadence.  The GUI expires a contribution that stops speaking, the
 #: same way it expires a surface, so this is liveness rather than politeness.
@@ -120,7 +128,6 @@ def run(*, quality: int, compression: int) -> int:
         "document_version": "boot",
         "panes": [
             {"id": PANE, "icon": "🖥", "title": "yRDP", "placement": "viewport"},
-            {"id": RAIL_PANE, "icon": "🖥", "title": "yRDP"},
         ],
     }
     # ⛔ REGISTER BEFORE DECLARING, and never the other way round.  The daemon
