@@ -464,6 +464,41 @@ def cmd_detach(args: argparse.Namespace) -> int:
     )
 
 
+def attach_viewer(name: str, *, quality: int = 9, compression: int = 0):
+    """Open a session if needed and build its viewer. Returns the Viewer.
+
+    The daemon's entry point into the session machinery. Deliberately does NOT
+    emit an OSC or block: only a process inside the target session's PTY can
+    announce a surface, so the daemon returns the URL and the client speaks it.
+    """
+    t = config_mod.load_target(name)
+    if "up" in t.hooks and not substrate.reachable(t):
+        substrate.run_hook(t, "up", timeout=600.0)
+        deadline = time.monotonic() + 600.0
+        while time.monotonic() < deadline and not substrate.reachable(t):
+            time.sleep(5)
+
+    conn = t.connection
+    s = session.load(name)
+    if s is not None and not s.alive():
+        s = None
+    direct = None
+    if s is None and conn is not None and conn.protocol == config_mod.PROTOCOL_VNC:
+        direct = (conn.host, conn.port)
+    elif s is None:
+        s = session.open_session(t, protocol=None, force=True)
+    return view.attach(
+        s, endpoint=direct, label=t.name, title=t.machine_label,
+        quality=quality, compression=compression,
+    )
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    from . import daemon
+
+    return daemon.serve()
+
+
 def cmd_pick(args: argparse.Namespace) -> int:
     from . import pick
 
@@ -591,6 +626,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     wt(sub.add_parser("detach", help="take a surface out of the viewport; it keeps running")
        ).set_defaults(func=cmd_detach)
+
+    sub.add_parser(
+        "daemon", help="run the durable half: the control endpoint and the warm state"
+    ).set_defaults(func=cmd_daemon)
 
     pk = sub.add_parser(
         "pick",
