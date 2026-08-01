@@ -101,7 +101,7 @@ Read `docs/architecture.md` for the design and the reasoning behind each rule.
 - source code: `GPL-3.0-or-later`
 - repository documentation (`*.md`) and skills: `CC BY-SA 4.0`
 
-See `LICENSE`, `LICENSE-GPL-3.0`, `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.
+See `LICENSE` (the full GPL-3.0 text), `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.
 
 Contributions need a signed CLA, because this project is also licensed
 commercially. See `CONTRIBUTING.md` and `CLA.md` — it is a page, you keep your
