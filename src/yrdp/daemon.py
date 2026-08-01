@@ -318,13 +318,13 @@ def route(declared: str, live: list[str]) -> tuple[str, str]:
         return live[0], ""
     if not live:
         return "", (
-            "no yRDP chooser is listening on this host, so there is nowhere to "
-            "put the desktop. Open one with `yrdp pick` in a yggterm session."
+            "No chooser is listening any more, so there is nowhere to put this "
+            "desktop. Run yrdp pick in a yggterm session and connect again."
         )
     return "", (
-        f"{len(live)} yRDP choosers are open and this action did not say which "
-        f"one clicked, so the desktop cannot be addressed. Close the others, or "
-        f"name a target directly with `yrdp view --target <name>`."
+        f"{len(live)} choosers are open and the click did not say which one "
+        f"asked, so this desktop has no address. Close the others, or open one "
+        f"directly with yrdp view --target <name>."
     )
 
 
@@ -348,7 +348,7 @@ def _connect(session_id: str, target: str, quality: int, compression: int) -> No
         # different hat.
         HUB.errors[target] = str(exc)
         HUB.probes.pop(target, None)
-        HUB.push(session_id, "toast", "error", {"text": f"yRDP: {exc}"})
+        HUB.push(session_id, "toast", "error", {"text": str(exc)})
         return
     HUB.push(session_id, "web-surface", "open", {
         "session": session_id,
@@ -461,14 +461,24 @@ def _handle(conn: socket.socket) -> None:
             # while they look at the document pane.
             warned = schema()
             warned["widgets"].insert(1, {"kind": "label", "text": f"⚠ {refusal}"})
-            _respond(conn, {"toast": f"yRDP: {refusal}", "schema": warned})
+            # NO "yRDP:" in the text. The GUI titles the card with the pane's
+            # own title — which is "yRDP" — so a prefixed body reads "yRDP ·
+            # yRDP: no chooser…" on screen, and the operator photographed
+            # exactly that. The app names itself once, in the place the
+            # platform asks it to.
+            _respond(conn, {"toast": refusal, "schema": warned})
             return
         HUB.errors.pop(name, None)  # a retry clears the last failure's message
         threading.Thread(
             target=_connect, args=(session_id, name, 9, 0), daemon=True
         ).start()
+        # NO TOAST ON THE HAPPY PATH. The reply's schema puts "Connecting" in
+        # the pane the operator is already looking at, so a notification on top
+        # of it says nothing they cannot see — and it does not fade: it lands in
+        # the notification centre for them to clear afterwards. A click that
+        # worked is not news. Refusals and failures still speak, because those
+        # are the ones the pane may lose.
         _respond(conn, {
-            "toast": f"yRDP: connecting to {name}…",
             "schema": {
                 "title": "yRDP",
                 "widgets": [
