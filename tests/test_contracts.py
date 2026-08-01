@@ -688,7 +688,8 @@ def test_two_choosers_and_no_session_is_refused_by_name_not_guessed(hub):
 
     session, refusal = route("", ["a", "b"])
     assert session == ""
-    assert "2 yRDP choosers" in refusal
+    assert "2 choosers are open" in refusal
+    assert "yrdp view --target" in refusal, "a refusal that names no way out"
 
 
 def test_a_connect_with_nobody_listening_is_refused_not_dead_lettered(hub):
@@ -698,7 +699,8 @@ def test_a_connect_with_nobody_listening_is_refused_not_dead_lettered(hub):
 
     session, refusal = route("", [])
     assert session == ""
-    assert "no yRDP chooser is listening" in refusal
+    assert "No chooser is listening" in refusal
+    assert "yrdp pick" in refusal, "a refusal that names no way out"
 
 
 def test_a_client_that_stopped_polling_stops_vouching_for_itself(hub, monkeypatch):
@@ -750,3 +752,52 @@ def test_a_failed_connect_drops_the_probe_so_the_pane_can_leave_connecting(hub, 
 
     assert "t" not in hub.probes, "a failure left the cache warm and the pane frozen"
     assert "boom" in hub.errors["t"], "the reason was not recorded anywhere readable"
+
+
+# -- the chooser is addressable before it is clickable -----------------------
+
+
+def test_the_daemon_knows_the_chooser_before_the_operator_can_click_it(monkeypatch):
+    """THE first-launch refusal the operator photographed.
+
+    The daemon learns a client's session id from its `/events` poll and from
+    nowhere else, so a chooser that declares its pane and polls four seconds
+    later cannot be addressed for those four seconds — and the very first click
+    always lands there, because a person clicks the pane the moment it appears.
+    The answer was "no yRDP chooser is listening" about the chooser they were
+    looking at; clicking again worked, which is what made it read as flaky.
+    """
+    from yrdp import daemon, pick
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setenv("YGGTERM_SESSION_ID", "local://s1")
+    monkeypatch.setattr(daemon, "ensure", lambda *a, **k: "http://127.0.0.1:1")
+    monkeypatch.setattr(
+        pick, "_get", lambda control, path, timeout=5.0: calls.append(("get", path)) or {}
+    )
+    monkeypatch.setattr(
+        pick, "_osc", lambda verb, action, payload: calls.append(("osc", f"{verb}:{action}"))
+    )
+
+    def stop(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pick.time, "sleep", stop)
+    assert pick.run(quality=9, compression=0) == 130
+
+    declared = next(
+        (i for i, (_, what) in enumerate(calls) if what == "sidebar:declare"), None
+    )
+    registered = next(
+        (
+            i
+            for i, (kind, what) in enumerate(calls)
+            if kind == "get" and what == "/events?session=local://s1"
+        ),
+        None,
+    )
+    assert declared is not None, "the chooser never declared its pane"
+    assert registered is not None and registered < declared, (
+        "the chooser was on screen and clickable before the daemon had any way "
+        "to know who to answer"
+    )

@@ -219,6 +219,15 @@ The rule now, in `daemon.route`:
 The registration costs nothing new: a client's existing 4 s `/events` poll *is* its liveness,
 and `CLIENT_TTL` (three missed polls) is what separates gone from slow.
 
+⛔ **A chooser registers BEFORE it declares — never the other way round.** The poll is the
+only door through which the daemon ever learns a session id, so a chooser that puts its pane
+on screen and polls four seconds later is *unaddressable for those four seconds* — and the
+operator's first click lands inside that window every time, because a person clicks the pane
+the moment it appears. The refusal they got named the very chooser they were looking at, and
+clicking again worked, which is exactly what made a race read as flakiness. One round trip
+on an already-open socket, before there is anything on screen to click, closes it
+(`pick.run`, locked by `test_the_daemon_knows_the_chooser_before_the_operator_can_click_it`).
+
 ⛔ **Never resolve the last case by picking the newest client.** Opening someone's desktop in
 a viewport that did not ask for it is the one outcome worse than hanging.
 
@@ -229,6 +238,12 @@ Two rules fall out of the same lesson and are locked by tests:
   correct, and reachable nowhere while "Connecting" stays on screen.
 - **Undeliverable mail is dropped, not kept.** A client that dies mid-connect would otherwise
   leave its viewer URL queued for the daemon's whole life.
+- **Notify about outcomes the pane cannot carry, and name the app once.** yggterm titles a
+  pane's notification with that pane's own title — "yRDP" — so a body beginning `yRDP:`
+  says the name twice on screen. And a click that WORKED is not news: the same reply's
+  schema already puts "Connecting" in the pane the operator is looking at, whereas a toast
+  goes to the notification centre and waits there to be cleared. So the happy path is
+  silent; refusals and failures speak.
 
 ## 6. Verbs
 

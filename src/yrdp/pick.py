@@ -123,6 +123,19 @@ def run(*, quality: int, compression: int) -> int:
             {"id": RAIL_PANE, "icon": "🖥", "title": "yRDP"},
         ],
     }
+    # ⛔ REGISTER BEFORE DECLARING, and never the other way round.  The daemon
+    # learns a client's session id from an `/events` poll and from NOWHERE ELSE
+    # (yggterm's action POST carries no session — see `daemon.route`).  So a
+    # chooser that declares its pane first and polls four seconds later is
+    # unaddressable for those four seconds, and the operator's very first click
+    # lands inside that window every single time: the pane appears, they click
+    # it, and the daemon refuses with "no yRDP chooser is listening" about the
+    # chooser they are looking at.  Clicking again worked, which is exactly what
+    # made it read as flaky rather than as a race.
+    #
+    # The registration costs one round trip on a socket that is already open,
+    # and it happens before anything is on screen to click.
+    _get(control, f"/events?session={session_id}")
     _osc("sidebar", "declare", declare)
     print(f"[yrdp] choose a target in the viewport (daemon {control})", file=sys.stderr)
 
