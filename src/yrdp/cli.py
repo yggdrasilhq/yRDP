@@ -22,6 +22,7 @@ connect, and the lore that says what to do once connected.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -31,7 +32,7 @@ from typing import Any
 from . import lore, session, substrate, view
 from . import config as config_mod
 from .config import ConfigError, Target, list_targets, load_target, targets_dir
-from .geometry import GeometryMismatch
+from .geometry import Geometry, GeometryMismatch
 
 PROG = "yrdp"
 
@@ -363,6 +364,106 @@ def reveal_target(
     return 0
 
 
+def cmd_attach(args: argparse.Namespace) -> int:
+    """`attach` — the named half of the dual-viewport contract.
+
+    Two modes, and the default is the one that protects the agent:
+
+    * ``--scaled`` (default) — the agent's pinned contract stays authoritative
+      and the human sees it scaled into whatever viewport they have.  Their view
+      may be letterboxed when the aspects differ; the agent's coordinates stay
+      valid.  This is what ``view`` has always done.
+    * ``--adopt`` — the HUMAN's viewport wins.  The surface is re-pinned to the
+      size they name, so they get a pixel-exact full-bleed view and **every
+      coordinate the agent holds is invalidated, loudly**: the epoch moves, the
+      surface is dirty until re-observed, and a click quoting a stale epoch is
+      refused with a message naming who resized it and when.
+
+    ``--adopt`` is deliberately not the default and deliberately not implicit.
+    It is the answer to "I hid my cwd tree and the picture no longer fits",
+    because rescaling cannot fix an ASPECT change — only re-pinning can.
+    """
+    if not args.adopt:
+        return reveal_target(
+            args.target,
+            read_only=args.read_only,
+            title=args.title,
+            once=args.once,
+            no_open=args.no_open,
+            password_entry=args.password_entry,
+            protocol=_protocol(args),
+            quality=args.quality,
+            compression=args.compression,
+        )
+
+    t = _target(args)
+    # A VNC target's framebuffer belongs to the GUEST, not to us: we are a
+    # CLIENT of a console someone else sized. Refusing is the honest answer —
+    # silently scaling while calling it "adopt" would be a lie of success, and
+    # the macOS console in particular is pinned by its VM's video device.
+    if t.connection is not None and t.connection.protocol == config_mod.PROTOCOL_VNC:
+        raise SystemExit(
+            f"[{PROG}] {t.name} speaks VNC, so its framebuffer is the guest's and yRDP "
+            f"cannot re-pin it — only an RDP session negotiates its own size. Attach "
+            f"it --scaled, or change the size at the guest and `yrdp repin` to record it."
+        )
+    if not args.geometry:
+        raise SystemExit(
+            f"[{PROG}] --adopt needs --geometry WxH: the viewport size is the human's, "
+            f"and yRDP cannot see it from here. Read it off `server app state`'s window "
+            f"inner_size, or from a `web screenshot --session` of the surface."
+        )
+
+    adopted = Geometry.parse(args.geometry)
+    previous = session.load(args.target)
+    # Carry the epoch ACROSS the reopen. A fresh session would start at 0, and an
+    # epoch that goes backwards is worse than none: a coordinate stamped at the
+    # old surface's epoch 1 would compare equal to the new surface's epoch 1 and
+    # the refusal that should have fired would not.
+    carried = (previous.geometry_epoch if previous else 0) + 1
+    was = previous.geometry if previous else t.geometry.stamp
+
+    reopened = dataclasses.replace(t, geometry=adopted)
+    s = session.open_session(
+        reopened, password_entry=args.password_entry, protocol=_protocol(args), force=True
+    )
+    s.geometry_epoch = carried
+    s.resized_by = args.by or "human viewport (attach --adopt)"
+    s.resized_at = time.time()
+    s.events.append(f"adopted {was} → {s.geometry} (epoch {carried})")
+    session.save(s)
+    print(
+        f"[{PROG}] {t.name}: adopted {was} → {s.geometry} (epoch {carried}) — "
+        f"every coordinate read before now is refused until you re-observe",
+        file=sys.stderr,
+    )
+    return reveal_target(
+        args.target,
+        read_only=args.read_only,
+        title=args.title,
+        once=args.once,
+        no_open=True,  # the session we just opened IS the one to reveal
+        quality=args.quality,
+        compression=args.compression,
+    )
+
+
+def cmd_detach(args: argparse.Namespace) -> int:
+    """`detach` — stop looking. NEVER stops the session.
+
+    The invariant the whole split rests on: detach is about *looking*, never
+    about *living*. The surface, its processes and its pinned geometry all
+    survive, which is what makes an agent surface safe to hand to a human and
+    take back.
+    """
+    s = session.load(args.target)
+    closed = view.detach(s)
+    return _emit(
+        {"target": args.target, "viewers_closed": closed, "session_alive": bool(s and s.alive())},
+        f"{args.target}: {closed} viewer(s) closed; the session keeps running",
+    )
+
+
 def cmd_pick(args: argparse.Namespace) -> int:
     from . import pick
 
@@ -471,6 +572,25 @@ def build_parser() -> argparse.ArgumentParser:
     vw.add_argument("--vnc", action="store_true")
     _quality_flags(vw)
     vw.set_defaults(func=cmd_view)
+
+    at = wt(sub.add_parser("attach", help="put this surface in a human viewport"))
+    at.add_argument("--scaled", action="store_true",
+                    help="the agent's contract wins; the human sees it scaled (default)")
+    at.add_argument("--adopt", action="store_true",
+                    help="the human's viewport wins; RE-PINS the surface and invalidates coordinates")
+    at.add_argument("--geometry", help="WxH[@scale] to adopt (required with --adopt)")
+    at.add_argument("--by", help="who is adopting, recorded on the epoch bump")
+    at.add_argument("--read-only", action="store_true")
+    at.add_argument("--title")
+    at.add_argument("--once", action="store_true")
+    at.add_argument("--no-open", action="store_true")
+    at.add_argument("--password-entry")
+    at.add_argument("--vnc", action="store_true")
+    _quality_flags(at)
+    at.set_defaults(func=cmd_attach)
+
+    wt(sub.add_parser("detach", help="take a surface out of the viewport; it keeps running")
+       ).set_defaults(func=cmd_detach)
 
     pk = sub.add_parser(
         "pick",
