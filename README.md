@@ -95,3 +95,10 @@ Requires `Xvfb`, `xdotool` and ImageMagick, a client for the protocol in use (`x
 or `xtigervncviewer`), and — for `view` — `x11vnc`, `websockify` and noVNC. It runs on any
 host that has them; nothing about it is tied to a particular machine.
 Read `docs/architecture.md` for the design and the reasoning behind each rule.
+
+## License
+
+- source code: `GPL-3.0-or-later`
+- repository documentation (`*.md`) and skills: `CC BY-SA 4.0`
+
+See `LICENSE`, `LICENSE-GPL-3.0`, `LICENSE-CC-BY-SA-4.0`, and `NOTICE`.
