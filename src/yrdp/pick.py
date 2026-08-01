@@ -27,6 +27,7 @@ mechanism; `pick` is a special case that predates it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -34,14 +35,17 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import config as config_mod
 from . import session as sessions
 from . import view
 
-#: The pane id.  One pane, so the id is only ever echoed back on an action.
+#: The viewport pane id — the chooser proper.
 PANE = "targets"
+
+#: The same list offered as a rail panel (see the declare for why both).
+RAIL_PANE = "targets-rail"
 
 #: Re-declare cadence.  The GUI expires a contribution that stops speaking, the
 #: same way it expires a surface, so this is liveness rather than politeness.
@@ -155,6 +159,23 @@ def _schema() -> dict:
     }
 
 
+def _document_version() -> str:
+    """A stamp over the CONTENT of the chooser, never a clock.
+
+    ⛔ This was a clock for one debugging session and the chooser never painted.
+    The contract is explicit — the GUI refetches the viewport pane *only when
+    this moves* — so a value that moves every second means "the document changed"
+    on every 4s declare and every 2.5s liveness ping. The GUI dutifully refetched
+    forever and the surface never settled into a painted state, with no error
+    anywhere: transport fine, schema valid, endpoint reachable, nothing drawn.
+
+    Hashing the schema makes the stamp mean what the GUI thinks it means, and it
+    is also what makes a genuine change (a guest that just came up) propagate
+    promptly instead of on a timer.
+    """
+    return hashlib.sha256(json.dumps(_schema(), sort_keys=True).encode()).hexdigest()[:16]
+
+
 class _Handler(BaseHTTPRequestHandler):
     """The control endpoint. Three routes, and the GUI drives all of them."""
 
@@ -180,8 +201,9 @@ class _Handler(BaseHTTPRequestHandler):
             # tick on purpose — a target's reachability is exactly the kind of
             # thing that changes without anyone touching this process, and a
             # chooser showing a stale "not running" is worse than a refetch.
-            self._reply({"app_name": "yRDP", "document_version": str(int(time.time()))})
-        elif path == f"/pane/{PANE}":
+            self._reply({"app_name": "yRDP", "document_version": _document_version()})
+        elif path in (f"/pane/{PANE}", f"/pane/{RAIL_PANE}"):
+            # One list, two placements — the schema does not depend on which.
             self._reply(_schema())
         else:
             self._reply({"error": "no such route"}, 404)
@@ -252,7 +274,11 @@ def run(*, quality: int, compression: int) -> int:
 
     port = _free_port()
     control = f"http://127.0.0.1:{port}"
-    httpd = HTTPServer(("127.0.0.1", port), _Handler)
+    # THREADING, not the plain HTTPServer. The GUI pings liveness every ~2.5s
+    # AND fetches the pane schema; a single-threaded server serialises them
+    # behind whichever connection the client holds open, which presents as a
+    # chooser that declares itself and then hangs.
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     session_id = os.environ.get("YGGTERM_SESSION_ID", "")
@@ -261,9 +287,17 @@ def run(*, quality: int, compression: int) -> int:
         "control": control,
         "app_name": "yRDP",
         # The GUI refetches the viewport pane only when this moves.
-        "document_version": str(int(time.time())),
+        "document_version": _document_version(),
         "panes": [
+            # TWO placements on purpose. The viewport pane is the chooser the
+            # operator asked for; the rail pane is the same list as a right-hand
+            # panel, and it is ALSO the bisect that tells the two failure modes
+            # apart when nothing paints: a rail button that appears proves the
+            # OSC parsed, the contribution applied and the schema fetched, so a
+            # blank viewport is specifically about viewport placement rather
+            # than about this app's declare.
             {"id": PANE, "icon": "🖥", "title": "yRDP", "placement": "viewport"},
+            {"id": RAIL_PANE, "icon": "🖥", "title": "yRDP"},
         ],
     }
     _osc("sidebar", "declare", declare)
@@ -273,7 +307,7 @@ def run(*, quality: int, compression: int) -> int:
     try:
         while chosen is None:
             time.sleep(DECLARE_SECONDS)
-            declare["document_version"] = str(int(time.time()))
+            declare["document_version"] = _document_version()
             _osc("sidebar", "declare", declare)
             with _Handler.lock:
                 chosen = _Handler.chosen
