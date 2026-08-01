@@ -645,3 +645,108 @@ class _FakeRfb:
         from yrdp.rfb import Frame
 
         return Frame(2, 2, bytearray(2 * 2 * 4), complete=True)
+
+
+# -- the daemon addresses its mail ------------------------------------------
+#
+# Every lock here guards the same class of failure: a connect that SUCCEEDS and
+# tells nobody. It was found live — the guest up, the RDP session live for two
+# hours, the viewer URL built and finished, and the operator watching
+# "Connecting" because the answer was filed under a session id nobody polls.
+
+
+@pytest.fixture()
+def hub(monkeypatch):
+    """A fresh hub per test. The daemon's is module-global and long-lived."""
+    from yrdp import daemon
+
+    monkeypatch.setattr(daemon, "HUB", daemon._Hub())
+    return daemon.HUB
+
+
+def test_a_sessionless_action_reaches_the_one_client_that_is_listening(hub):
+    """THE regression. yggterm's action POST carries no session, so the daemon
+    must resolve it from who is polling — and with one chooser open that is not
+    a guess, it is the answer."""
+    from yrdp.daemon import route
+
+    assert route("", ["local://abc"]) == ("local://abc", "")
+
+
+def test_a_declared_session_wins_over_the_daemons_own_bookkeeping(hub):
+    """Forward compatibility. The day the platform names the session on the
+    wire, that name must beat the fallback rather than race it."""
+    from yrdp.daemon import route
+
+    assert route("said-so", ["someone-else"]) == ("said-so", "")
+
+
+def test_two_choosers_and_no_session_is_refused_by_name_not_guessed(hub):
+    """Guessing here opens a desktop in a viewport that did not ask for one —
+    the single failure worse than hanging."""
+    from yrdp.daemon import route
+
+    session, refusal = route("", ["a", "b"])
+    assert session == ""
+    assert "2 yRDP choosers" in refusal
+
+
+def test_a_connect_with_nobody_listening_is_refused_not_dead_lettered(hub):
+    """The original bug's shape exactly: no reader, yet the work was done and
+    the answer queued. Refusing says so; queueing says nothing at all."""
+    from yrdp.daemon import route
+
+    session, refusal = route("", [])
+    assert session == ""
+    assert "no yRDP chooser is listening" in refusal
+
+
+def test_a_client_that_stopped_polling_stops_vouching_for_itself(hub, monkeypatch):
+    """A dead client must not keep winning the one-live-client resolution and
+    swallowing every desktop the operator asks for."""
+    from yrdp import daemon
+
+    clock = [1000.0]
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: clock[0])
+    hub.seen("local://gone")
+    assert hub.live_clients() == ["local://gone"]
+    clock[0] += daemon.CLIENT_TTL + 1
+    assert hub.live_clients() == []
+
+
+def test_undeliverable_mail_is_not_kept_for_ever(hub, monkeypatch):
+    """A client that dies mid-connect leaves a viewer URL queued. Invisible,
+    undeliverable, and — before this — growing for the daemon's whole life."""
+    from yrdp import daemon
+
+    clock = [1000.0]
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: clock[0])
+    hub.seen("local://live")
+    hub.push("local://live", "web-surface", "open", {"url": "u"})
+    hub.push("local://dead", "web-surface", "open", {"url": "u"})
+
+    hub.forget_dead_mailboxes()
+    assert "local://dead" not in hub.events, "mail for a client that never existed"
+    assert "local://live" in hub.events, "reaped a mailbox whose client is polling"
+
+    clock[0] += daemon.CLIENT_TTL + 1
+    hub.forget_dead_mailboxes()
+    assert hub.events == {}, "a client that stopped polling keeps its mail for ever"
+
+
+def test_a_failed_connect_drops_the_probe_so_the_pane_can_leave_connecting(hub, monkeypatch):
+    """The second forever-hang, same family. The GUI refetches a pane only when
+    the content stamp MOVES, so a failure that changed no cached state leaves
+    "Connecting" on screen with the error reachable nowhere."""
+    from yrdp import cli, daemon
+
+    hub.probes["t"] = (daemon.time.monotonic(), "transient", "ready")
+
+    def explode(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "attach_viewer", explode)
+    daemon._connect("local://s", "t", 9, 0)
+
+    assert "t" not in hub.probes, "a failure left the cache warm and the pane frozen"
+    assert "boom" in hub.errors["t"], "the reason was not recorded anywhere readable"

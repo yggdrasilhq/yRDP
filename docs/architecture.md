@@ -193,6 +193,43 @@ That difference in shape follows a difference in the far end, not a preference:
   resolved at connect time and handed to the client down an inherited file descriptor, so
   it never appears in argv, the environment, or on disk.
 
+### The chooser's mailbox — why the daemon has to work out who clicked
+
+The daemon is **per host**; its clients are **per session**. So when a connect finishes, the
+daemon holds a viewer URL and a question the platform does not answer: *whose viewport does
+this belong to?*
+
+yggterm's action POST is `{pane, action, values, value_keys}` — **no session** — even though
+the document channel it arrives on is session-scoped on the GUI's own side (`shell.rs`
+resolves the control URL *from* `session_path`, then declines to say so on the wire). That
+cost the operator a 2.5-hour hang: guest up, RDP session live, viewer built, and the answer
+filed in a mailbox keyed `""` while the client polled `/events?session=<its own id>` and
+collected nothing, for ever. **Nothing was wrong to find, because nothing was wrong** — the
+single most expensive failure mode this codebase can produce.
+
+The rule now, in `daemon.route`:
+
+| the daemon knows | it does |
+|---|---|
+| a session on the wire | uses it — forward-compatible, and the day the platform sends one this fallback goes cold |
+| exactly one client polling | uses it — **not a guess; the only possible answer** |
+| no client polling | refuses, by name |
+| two or more clients | refuses, by name |
+
+The registration costs nothing new: a client's existing 4 s `/events` poll *is* its liveness,
+and `CLIENT_TTL` (three missed polls) is what separates gone from slow.
+
+⛔ **Never resolve the last case by picking the newest client.** Opening someone's desktop in
+a viewport that did not ask for it is the one outcome worse than hanging.
+
+Two rules fall out of the same lesson and are locked by tests:
+
+- **A refusal must be READ, not just recorded.** The GUI refetches a pane only when the
+  content stamp moves, so a failed connect drops its probe — otherwise the error is real,
+  correct, and reachable nowhere while "Connecting" stays on screen.
+- **Undeliverable mail is dropped, not kept.** A client that dies mid-connect would otherwise
+  leave its viewer URL queued for the daemon's whole life.
+
 ## 6. Verbs
 
 ```

@@ -61,6 +61,12 @@ PROBE_TIMEOUT = 0.4
 #: is not holding an RDP client open forever.
 IDLE_EXIT_SECONDS = 3600.0
 
+#: How long a client's `/events` poll vouches for that client.  `pick` polls on
+#: a 4 s cadence, so three missed polls is a client that has GONE rather than a
+#: client that was slow.  This is what makes the routing below exact instead of
+#: hopeful: a mailbox is addressed to a session we heard from seconds ago.
+CLIENT_TTL = 12.0
+
 
 class _Hub:
     """Everything that is worth not rebuilding: probe state and the OSC queue."""
@@ -73,10 +79,27 @@ class _Hub:
         # this and writes to its own stdout — see the module docstring for why
         # the daemon cannot do it itself.
         self.events: dict[str, list[dict]] = {}
+        # Which client sessions are actually listening, by last `/events` poll.
+        # A mailbox addressed to anything else is a message into the void.
+        self.clients: dict[str, float] = {}
+        # The last connect failure per target, so a failure is something the
+        # operator READS rather than something the pane hides.
+        self.errors: dict[str, str] = {}
         self.last_seen = time.monotonic()
 
     def touch(self) -> None:
         self.last_seen = time.monotonic()
+
+    def seen(self, session: str) -> None:
+        """Record that a client is listening. Every poll is its own liveness."""
+        if session:
+            with self.lock:
+                self.clients[session] = time.monotonic()
+
+    def live_clients(self) -> list[str]:
+        now = time.monotonic()
+        with self.lock:
+            return sorted(s for s, at in self.clients.items() if now - at <= CLIENT_TTL)
 
     def push(self, session: str, verb: str, action: str, payload: dict) -> None:
         with self.lock:
@@ -87,6 +110,20 @@ class _Hub:
     def drain(self, session: str) -> list[dict]:
         with self.lock:
             return self.events.pop(session, [])
+
+    def forget_dead_mailboxes(self) -> None:
+        """Drop mail for clients that will never collect it.
+
+        Without this a client that dies mid-connect leaves its viewer URL queued
+        for the lifetime of the daemon — invisible, undeliverable, and growing.
+        """
+        now = time.monotonic()
+        with self.lock:
+            for sess in [
+                s for s in self.events
+                if now - self.clients.get(s, 0.0) > CLIENT_TTL
+            ]:
+                self.events.pop(sess, None)
 
 
 HUB = _Hub()
@@ -133,6 +170,7 @@ def _sweep() -> None:
         try:
             for name in config_mod.list_targets():
                 _probe(name)
+            HUB.forget_dead_mailboxes()
         except Exception:
             pass  # a bad target file must not take the daemon down
         if time.monotonic() - HUB.last_seen > IDLE_EXIT_SECONDS:
@@ -191,6 +229,12 @@ def schema() -> dict:
             continue
         shown += 1
         status, state_text = _probe(chosen.name)
+        # A failed attempt outranks the probe: a cheerful "ready · …" over the
+        # top of a connect that just threw tells the operator to click the same
+        # button again and expect a different answer.
+        failed = HUB.errors.get(chosen.name)
+        if failed:
+            status, state_text = "", f"last attempt failed — {failed}"
         rows.append(
             {
                 "kind": "list-row",
@@ -242,6 +286,48 @@ def document_version() -> str:
     return hashlib.sha256(json.dumps(schema(), sort_keys=True).encode()).hexdigest()[:16]
 
 
+def route(declared: str, live: list[str]) -> tuple[str, str]:
+    """Which client session a connect belongs to — or why it cannot be known.
+
+    ⛔ THE BUG THIS EXISTS TO END.  yggterm's action POST carries `pane`,
+    `action`, `values` and `value_keys` — and **no session**, even though the
+    document channel it arrives on is session-scoped on the GUI's own side.  So
+    `body["session"]` was empty, the outcome was filed under `""`, and the
+    client — polling `/events?session=<its own id>` — collected nothing, for
+    ever.  The operator watched "Connecting" while the guest was up, the RDP
+    session was live, and the viewer URL sat finished in a mailbox with no
+    reader.  A silent success is worse than a failure: nothing was wrong to
+    find, because nothing was wrong.
+
+    The fix does not guess.  Every client announces itself on the 4 s poll it
+    was already making, so the daemon KNOWS who is listening:
+
+    * a declared session wins outright — this is forward-compatible, and the
+      day the platform names the session on the wire this whole fallback stops
+      being reached;
+    * exactly one live client is not a guess, it is the answer;
+    * anything else is refused BY NAME.  Two choosers and a session-less action
+      is genuinely unknowable, and picking the newest would open a stranger's
+      desktop in the wrong viewport — the one failure worse than hanging.
+
+    Returns `(session, refusal)`; exactly one of the two is non-empty.
+    """
+    if declared:
+        return declared, ""
+    if len(live) == 1:
+        return live[0], ""
+    if not live:
+        return "", (
+            "no yRDP chooser is listening on this host, so there is nowhere to "
+            "put the desktop. Open one with `yrdp pick` in a yggterm session."
+        )
+    return "", (
+        f"{len(live)} yRDP choosers are open and this action did not say which "
+        f"one clicked, so the desktop cannot be addressed. Close the others, or "
+        f"name a target directly with `yrdp view --target <name>`."
+    )
+
+
 def _connect(session_id: str, target: str, quality: int, compression: int) -> None:
     """Do the work, then hand the client an OSC to speak.
 
@@ -254,7 +340,14 @@ def _connect(session_id: str, target: str, quality: int, compression: int) -> No
     try:
         viewer = cli.attach_viewer(target, quality=quality, compression=compression)
     except Exception as exc:  # a failed connect must not kill the daemon
-        HUB.push(session_id, "sidebar", "declare", {})  # no-op; keeps shape
+        # Both lines matter. The message is what the operator READS on the row;
+        # dropping the probe is what makes them SEE it — the GUI refetches a
+        # pane only when the content stamp moves, so a failure that changed no
+        # cached state would leave "Connecting" on screen with the error
+        # reachable nowhere. That is the same forever-hang wearing a
+        # different hat.
+        HUB.errors[target] = str(exc)
+        HUB.probes.pop(target, None)
         HUB.push(session_id, "toast", "error", {"text": f"yRDP: {exc}"})
         return
     HUB.push(session_id, "web-surface", "open", {
@@ -318,7 +411,12 @@ def _handle(conn: socket.socket) -> None:
         if method == "GET" and path == "/events":
             # The client's mailbox. It polls this and writes what it finds to
             # its own PTY, because only a process in that PTY can emit an OSC.
-            _respond(conn, {"events": HUB.drain(params.get("session", ""))})
+            # The poll doubles as the client's registration: this is the ONLY
+            # place the daemon ever learns a session id, since the GUI's action
+            # POST does not carry one. See `route`.
+            who = params.get("session", "")
+            HUB.seen(who)
+            _respond(conn, {"events": HUB.drain(who)})
             return
         if method != "POST" or path != "/action":
             _respond(conn, {"error": "no such route"}, 404)
@@ -354,6 +452,18 @@ def _handle(conn: socket.socket) -> None:
             return
 
         name = action.split(":", 1)[1]
+        session_id, refusal = route(session_id, HUB.live_clients())
+        if refusal:
+            # Land the operator back on a working chooser with the reason on it,
+            # never on a dead end. The reply's `toast` is a real GUI
+            # notification, unlike one pushed through the client's mailbox —
+            # that one only reaches the PTY's stderr, which nobody is reading
+            # while they look at the document pane.
+            warned = schema()
+            warned["widgets"].insert(1, {"kind": "label", "text": f"⚠ {refusal}"})
+            _respond(conn, {"toast": f"yRDP: {refusal}", "schema": warned})
+            return
+        HUB.errors.pop(name, None)  # a retry clears the last failure's message
         threading.Thread(
             target=_connect, args=(session_id, name, 9, 0), daemon=True
         ).start()
