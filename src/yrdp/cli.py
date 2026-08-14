@@ -25,6 +25,7 @@ import argparse
 import dataclasses
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -233,7 +234,11 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
         if len(parts) != 4:
             raise SystemExit(f"[{PROG}] --rect wants x,y,w,h")
         rect = tuple(parts)  # type: ignore[assignment]
-    shot = session.screenshot(s, Path(args.out).expanduser(), rect=rect)
+    # An unset --out lands in the system temp dir, never the working directory;
+    # see the flag's definition for why a relative default is unsafe here.
+    out = (Path(args.out).expanduser() if args.out
+           else Path(tempfile.gettempdir()) / f"yrdp-{args.target}-surface.png")
+    shot = session.screenshot(s, out, rect=rect)
     drift = "" if shot["observed"] == shot["geometry"] else f" ⚠ far end is {shot['observed']}"
     partial = "" if shot["complete"] else " ⚠ PARTIAL frame — not every rectangle arrived"
     return _emit(
@@ -641,7 +646,24 @@ def build_parser() -> argparse.ArgumentParser:
     wt(sub.add_parser("close", help="end a session")).set_defaults(func=cmd_close)
 
     ss = wt(sub.add_parser("screenshot", help="capture the pinned surface"))
-    ss.add_argument("--out", "-o", default="surface.png")
+    # ⛔ NO RELATIVE DEFAULT. A capture contains whatever is on the remote
+    # desktop, and this tool is driven overwhelmingly from inside repositories —
+    # so a bare `surface.png` writes a picture of somebody's live application
+    # into whichever working tree the caller happened to be standing in, where
+    # the next `git add -A` commits it and a push publishes it.
+    #
+    # ⚠ Neither half of that predicts it alone. "Do not share a working tree"
+    # and "never `git add -A`" are both ordinary advice and each is survivable
+    # by itself; composed, they produce a class neither one names — a tool
+    # silently seeding a secret into someone else's staging area. The caller is
+    # not doing anything wrong, which is exactly why the default has to be.
+    #
+    # ⇒ Default somewhere no repository can reach. `--out` is unchanged and
+    # still honoured, and the command prints the path it wrote either way, so
+    # nothing becomes harder to find — it only stops landing where it is
+    # dangerous. Resolved at parse time so `--help` shows a real path.
+    ss.add_argument("--out", "-o", default=None,
+                    help="where to write the capture (default: a temp file, never $PWD)")
     ss.add_argument("--rect", help="x,y,w,h — crop first, per the ladder")
     ss.set_defaults(func=cmd_screenshot)
 
