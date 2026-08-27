@@ -1,0 +1,13 @@
+{
+  "name": "@ygghq/yrdp",
+  "version": "0.1.0",
+  "description": "yRDP - the yggdrasilhq RDP companion, delivered by ynpm as a git-backed package (the tool's own design: a checkout that git pull updates)",
+  "bin": { "yrdp": "bin/yrdp" },
+  "files": ["bin/"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yggdrasilhq/yRDP.git"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "publishConfig": { "access": "public", "provenance": true }
+}
