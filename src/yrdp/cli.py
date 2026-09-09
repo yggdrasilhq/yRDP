@@ -34,6 +34,7 @@ from . import lore, session, substrate, view
 from . import config as config_mod
 from .config import ConfigError, Target, list_targets, load_target, targets_dir
 from .geometry import Geometry, GeometryMismatch
+from . import __version__
 
 PROG = "yrdp"
 
@@ -552,6 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=PROG, description="a general-purpose, agent-first RDP client"
     )
+    p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="verb", required=True)
 
     def wt(sp):

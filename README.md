@@ -17,10 +17,18 @@ in a target file, what to do once connected lives in lore, and how to start or s
 machine is a hook the target declares. All three are private to whoever owns them; none of
 them belongs in a client.
 
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh | sh
+ynpx @ygghq/yrdp
+```
+
 ## Using it
 
-No install step: it is a git checkout that `git pull` updates, like the lore it reads.
-Point it at your own target directory and lore store.
+The package is managed by ynpm, so updates and the verified executable path are
+shared with the rest of the yggterm fleet. Point it at your own target
+directory and lore store.
 
 ```sh
 export YRDP_TARGETS_DIR=/path/to/your/targets

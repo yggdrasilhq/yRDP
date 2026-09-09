@@ -1,0 +1,49 @@
+{
+  "name": "@ygghq/yrdp",
+  "version": "0.1.0",
+  "description": "Agent-first RDP/VNC client for the yggterm fleet",
+  "bin": {
+    "yrdp": "bin/yrdp"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "docs/",
+    "README.md",
+    "LICENSE",
+    "LICENSE-CC-BY-SA-4.0",
+    "NOTICE"
+  ],
+  "yggterm": {
+    "app": {
+      "name": "yrdp",
+      "label": "yRDP",
+      "icon": "🖥",
+      "binary": "yrdp",
+      "keytip": "R",
+      "verbs": [
+        {
+          "id": "pick",
+          "label": "New yRDP",
+          "args": ["pick"],
+          "keytip": "R",
+          "row_spawn": true
+        }
+      ],
+      "context_menu": {
+        "enabled": true,
+        "contexts": ["workspace", "session"],
+        "verbs": ["pick"]
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yggdrasilhq/yRDP.git"
+  },
+  "license": "GPL-3.0-or-later",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
