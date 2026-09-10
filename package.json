@@ -1,6 +1,6 @@
 {
   "name": "@ygghq/yrdp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent-first RDP/VNC client for the yggterm fleet",
   "bin": {
     "yrdp": "bin/yrdp"
@@ -14,7 +14,13 @@
     "LICENSE-CC-BY-SA-4.0",
     "NOTICE"
   ],
+  "ynpm": {
+    "build": "chmod +x bin/yrdp",
+    "bins": { "yrdp": "bin/yrdp" },
+    "watch": "@ygghq/yrdp"
+  },
   "yggterm": {
+    "schema": 1,
     "app": {
       "name": "yrdp",
       "label": "yRDP",
