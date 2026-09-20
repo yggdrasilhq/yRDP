@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from . import config as config_mod
@@ -85,6 +86,11 @@ class _Hub:
         # The last connect failure per target, so a failure is something the
         # operator READS rather than something the pane hides.
         self.errors: dict[str, str] = {}
+        # In-flight machine opens requested by the web sidebar's startpage,
+        # by request id. The page POSTs /api/open and polls /api/open/<id>;
+        # unlike the chooser path there is no OSC mailbox to route through —
+        # the page navigates itself to the viewer when the answer says ready.
+        self.opens: dict[str, dict] = {}
         self.last_seen = time.monotonic()
 
     def touch(self) -> None:
@@ -189,6 +195,11 @@ def machines() -> list[tuple[str, list]]:
     because each has its own hooks and its own lore. Right for the agent lane,
     wrong for a chooser: two rows that open the same desktop, named after
     whichever application happens to be installed, describe nothing.
+
+    The row is named after the MACHINE — the target that names its own machine
+    (`win0` in "win0 Windows guest"), not an application that happens to run on
+    it (`tws`, `pl9` in "Windows guest"). An operator's sidebar reads
+    macos, win0, win1: the names the machines answer to.
     """
     groups: dict[tuple, list] = {}
     for name in config_mod.list_targets():
@@ -200,9 +211,20 @@ def machines() -> list[tuple[str, list]]:
     out = []
     for targets in groups.values():
         targets.sort(key=lambda t: t.name)
-        out.append((targets[0].machine_label, targets))
+        out.append((machine_display(targets).name, targets))
     out.sort(key=lambda pair: pair[0].lower())
     return out
+
+
+def machine_display(targets: list):
+    """Which target lends the group its NAME: the one whose own `machine`
+    string contains it. `win0` names the box; `tws` names an app on it. Falls
+    back to the alphabetically first target, the old behaviour, when no target
+    self-identifies."""
+    for t in targets:
+        if t.name.lower() in t.machine_label.lower():
+            return t
+    return targets[0]
 
 
 def _representative(targets: list):
@@ -286,6 +308,130 @@ def document_version() -> str:
     return hashlib.sha256(json.dumps(schema(), sort_keys=True).encode()).hexdigest()[:16]
 
 
+# -- the web sidebar's API ----------------------------------------------------
+#
+# The startpage is served by a per-session websockify bridge on ITS OWN port,
+# while machine truth lives here, on the control port. The two are different
+# origins, so every /api answer carries permissive CORS: the daemon binds
+# loopback only, and the only secret behind it is "which machines exist" —
+# exactly what a chooser on the same host is told anyway.
+
+
+def api_machines() -> list[dict]:
+    """One row per MACHINE: what it is, whether it is connected, where its
+    viewer bridge is. The startpage is these rows — connected machines first,
+    and a row that is connected carries the web port a viewer attaches to."""
+    from . import session as sessions
+
+    out: list[dict] = []
+    for _label, targets in machines():
+        rep = _representative(targets)
+        status, state_text = _probe(rep.name)
+        failed = HUB.errors.get(rep.name)
+        if failed:
+            status, state_text = "", f"last attempt failed — {failed}"
+        live = None
+        for t in targets:
+            s = sessions.load(t.name)
+            if s is not None and s.alive():
+                live = s
+                break
+        web_port = 0
+        if live is not None and live.viewers:
+            web_port = int(live.viewers[-1].get("web_port") or 0)
+        out.append(
+            {
+                "id": rep.name,
+                "title": machine_display(targets).name,
+                "subtitle": state_text,
+                "status": status,
+                "live": live is not None,
+                "web_port": web_port,
+                "protocol": (rep.connection.protocol if rep.connection else ""),
+                "targets": [t.name for t in targets],
+            }
+        )
+    return out
+
+
+def _open_worker(request_id: str, target: str, quality: int, compression: int) -> None:
+    """attach_viewer off the reply path — a cold guest runs its `up` hook and a
+    cold RDP negotiation takes ten seconds, and an HTTP handler that waits that
+    long reads as a hung sidebar. The page polls the request id instead."""
+    from . import cli
+
+    entry = HUB.opens.get(request_id)
+    if entry is None:
+        return
+    try:
+        viewer = cli.attach_viewer(target, quality=quality, compression=compression)
+    except Exception as exc:  # a failed connect must not kill the daemon
+        HUB.errors[target] = str(exc)
+        HUB.probes.pop(target, None)
+        entry.update(status="failed", error=str(exc), done=time.time())
+        return
+    entry.update(
+        status="ready",
+        web_port=viewer.web_port,
+        url=viewer.url,
+        geometry=viewer.target,
+        done=time.time(),
+    )
+
+
+def _api_open(body: dict) -> tuple[dict, int]:
+    from . import cli  # noqa: F401 — fails loudly here, not inside the thread
+
+    target = str(body.get("target") or "")
+    try:
+        config_mod.load_target(target)
+    except config_mod.ConfigError as exc:
+        return {"error": str(exc)}, 400
+    HUB.errors.pop(target, None)  # a fresh attempt clears the last failure
+    request_id = uuid.uuid4().hex[:12]
+    HUB.opens[request_id] = {"status": "working", "target": target, "done": None}
+    threading.Thread(
+        target=_open_worker, args=(request_id, target, 9, 0), daemon=True
+    ).start()
+    return {"request": request_id}, 200
+
+
+def _api_screenshot(body: dict) -> tuple[bytes | dict, str, int]:
+    """A still frame of a machine's durable session, as image/png.
+
+    Only sessions have frames — a direct-VNC console target has no surface we
+    own, and refusing by name beats returning a screenshot of nothing. Errors
+    come back as a JSON body, so the pane can show a sentence, not a status."""
+    from . import session as sessions
+
+    target = str(body.get("target") or "")
+    s = sessions.load(target)
+    if s is None or not s.alive():
+        return (
+            {"error": f"{target}: no live session to screenshot — connect it first"},
+            "application/json",
+            400,
+        )
+    try:
+        out = config_mod.state_dir() / "screenshots"
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"{target}-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        sessions.screenshot(s, path)
+        return path.read_bytes(), "image/png", 200
+    except Exception as exc:
+        return {"error": f"{target}: screenshot failed — {exc}"}, "application/json", 400
+
+
+def _forget_old_opens() -> None:
+    """Answers nobody collected still linger — drop them after a minute."""
+    now = time.time()
+    for rid in [
+        r for r, e in HUB.opens.items()
+        if e.get("done") is not None and now - e["done"] > 60.0
+    ]:
+        HUB.opens.pop(rid, None)
+
+
 def route(declared: str, live: list[str]) -> tuple[str, str]:
     """Which client session a connect belongs to — or why it cannot be known.
 
@@ -361,11 +507,18 @@ def _connect(session_id: str, target: str, quality: int, compression: int) -> No
 # -- the control endpoint ----------------------------------------------------
 
 
-def _respond(conn: socket.socket, body: dict, code: int = 200) -> None:
-    blob = json.dumps(body).encode()
+def _respond(conn: socket.socket, body: dict | bytes, code: int = 200,
+             content_type: str = "application/json") -> None:
+    blob = body if isinstance(body, bytes) else json.dumps(body).encode()
     head = (
-        f"HTTP/1.1 {code} {'OK' if code == 200 else 'Not Found'}\r\n"
-        f"Content-Type: application/json\r\nContent-Length: {len(blob)}\r\n"
+        f"HTTP/1.1 {code} {'OK' if code == 200 else 'Not Found' if code == 404 else 'Error'}\r\n"
+        f"Content-Type: {content_type}\r\nContent-Length: {len(blob)}\r\n"
+        # The web sidebar's pages are served by per-session bridges on their own
+        # ports; this control endpoint is the machine truth they render. Loopback
+        # only, so a permissive origin hands nothing to anyone off-box.
+        f"Access-Control-Allow-Origin: *\r\n"
+        f"Access-Control-Allow-Headers: Content-Type\r\n"
+        f"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         f"Connection: close\r\n\r\n"
     ).encode()
     try:
@@ -405,8 +558,25 @@ def _handle(conn: socket.socket) -> None:
         if method == "GET" and path == "/ping":
             _respond(conn, {"app_name": "yRDP", "document_version": document_version()})
             return
+        if method == "OPTIONS":
+            # The sidebar's pages live on bridge origins; a POST with a JSON
+            # body preflights. Answer the handshake, carry no body.
+            _respond(conn, b"", 200, "text/plain")
+            return
         if method == "GET" and path.startswith("/pane/"):
             _respond(conn, schema())
+            return
+        if method == "GET" and path == "/api/machines":
+            _respond(conn, api_machines())
+            return
+        if method == "GET" and path.startswith("/api/open/"):
+            _forget_old_opens()
+            rid = path.rpartition("/")[2]
+            entry = HUB.opens.get(rid)
+            if entry is None:
+                _respond(conn, {"error": "no such open request"}, 404)
+            else:
+                _respond(conn, entry)
             return
         if method == "GET" and path == "/events":
             # The client's mailbox. It polls this and writes what it finds to
@@ -418,7 +588,7 @@ def _handle(conn: socket.socket) -> None:
             HUB.seen(who)
             _respond(conn, {"events": HUB.drain(who)})
             return
-        if method != "POST" or path != "/action":
+        if method != "POST" or path not in ("/action", "/api/open", "/api/screenshot"):
             _respond(conn, {"error": "no such route"}, 404)
             return
 
@@ -443,7 +613,15 @@ def _handle(conn: socket.socket) -> None:
         values = body.get("values") or {}
         session_id = str(body.get("session") or params.get("session") or "")
 
-        if action == "search":
+        if path == "/api/open":
+            payload, code = _api_open(body)
+            _respond(conn, payload, code)
+            return
+        if path == "/api/screenshot":
+            payload, content_type, code = _api_screenshot(body)
+            _respond(conn, payload, code, content_type)
+            return
+        if path == "/action" and action == "search":
             HUB.query = str(values.get("q") or "")
             _respond(conn, {"schema": schema()})
             return

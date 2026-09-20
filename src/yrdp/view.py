@@ -190,6 +190,30 @@ def _matte_colour() -> str:
     return raw if re.fullmatch(r"[0-9a-fA-F]{6}", raw) else "262a33"
 
 
+def _publish_control(root: Path) -> None:
+    """Publish the daemon's control URL beside the page, as ``control.json``.
+
+    The startpage needs machine truth — what is connected, where each session's
+    bridge is — and that lives on the control port, a DIFFERENT origin from this
+    bridge. The page cannot guess the port, and query parameters would make the
+    starting page depend on being announced by a client that already knows one.
+    A small same-origin file rewritten on every attach is the whole contract:
+    the page fetches it, and a stale copy at worst names a daemon that is no
+    longer there, which the page already knows how to say.
+    """
+    from . import daemon  # lazy: the daemon pulls cli, which pulls this module
+
+    try:
+        port = int(json.loads(daemon.state_path().read_text())["port"])
+    except (OSError, ValueError, KeyError):
+        return  # no daemon on this host yet; the startpage will say so
+    payload = json.dumps({"control": f"http://127.0.0.1:{port}"}).encode()
+    target = root / "control.json"
+    # Rewrite only on change — the bridge serves from disk per request.
+    if not target.is_file() or target.read_bytes() != payload:
+        target.write_bytes(payload)
+
+
 def attach(
     s: Session | None,
     *,
@@ -217,7 +241,9 @@ def attach(
             "the reveal needs websockify on this host; install it, or use "
             "`yrdp screenshot` for a still frame"
         )
-    root = str(_web_root())
+    web_root = _web_root()
+    _publish_control(web_root)
+    root = str(web_root)
     web_port = _free_port(6100, 6200)
     pids: list[int] = []
 
