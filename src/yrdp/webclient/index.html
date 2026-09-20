@@ -207,6 +207,11 @@
   }
   #status[data-show="1"] { opacity: 1; }
 
+  /* The `display` set on #screen/#pane would beat the UA's [hidden] rule and
+     leave an invisible layer parked over the startpage, eating every click —
+     measured in the browser, not guessed. State beats layout explicitly. */
+  #screen[hidden], #pane[hidden] { display: none; }
+
   /* The toast: a glass pill at the bottom, on the pane's material. */
   #toast {
     position: absolute; left: 50%; bottom: 22px; z-index: 20;
