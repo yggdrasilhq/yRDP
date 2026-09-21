@@ -73,7 +73,10 @@ class _Hub:
     """Everything that is worth not rebuilding: probe state and the OSC queue."""
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        # Reentrant on purpose: set_active holds the lock and reads prefs
+        # through prefs_for, which locks again — a plain Lock deadlocks the
+        # handler thread and every /api/active POST hangs forever.
+        self.lock = threading.RLock()
         self.probes: dict[str, tuple[float, str, str]] = {}
         self.query = ""
         # OSC the daemon wants emitted, per client session. The client polls
@@ -91,7 +94,39 @@ class _Hub:
         # unlike the chooser path there is no OSC mailbox to route through —
         # the page navigates itself to the viewer when the answer says ready.
         self.opens: dict[str, dict] = {}
+        # THE ACTIVE MACHINE — the one a viewport surface should be showing.
+        # The sidebar is the remote control and the viewport is a follower:
+        # every connect (chooser, sidebar, a fresh reveal) moves this pointer,
+        # and the viewport's 1 s poll re-aims at whatever it names. Prefs are
+        # the human viewer controls (keyboard passthrough, auto-scaling), kept
+        # per machine so switching boxes does not reset them.
+        self.active: dict | None = None
+        self.prefs: dict[str, dict] = {}
         self.last_seen = time.monotonic()
+
+    def prefs_for(self, target: str) -> dict:
+        with self.lock:
+            return dict(self.prefs.setdefault(
+                target, {"keyboard": True, "scaling": True}
+            ))
+
+    def set_active(self, target: str, web_port: int | None = None) -> None:
+        """Aim every viewport at `target`. Any successful connect calls this —
+        the last reveal wins, exactly like a TV's input switching."""
+        resolved = web_port if web_port else _machine_bridge(target)
+        with self.lock:
+            self.active = {
+                "target": target,
+                "web_port": resolved or 0,
+                "prefs": self.prefs_for(target),
+                "epoch": ((self.active or {}).get("epoch", 0)) + 1,
+            }
+
+    def active_payload(self) -> dict:
+        with self.lock:
+            if self.active is None:
+                return {"target": None, "epoch": 0}
+            return dict(self.active)
 
     def touch(self) -> None:
         self.last_seen = time.monotonic()
@@ -227,6 +262,27 @@ def machine_display(targets: list):
     return targets[0]
 
 
+def _machine_bridge(machine: str) -> int:
+    """The websockify port of the newest viewer bridge on this MACHINE.
+
+    Sessions are recorded per TARGET, and a machine's live session may sit
+    under an application target (`pl9`) while the sidebar points at the
+    machine name (`win0`) — so search the whole group, newest viewer wins.
+    """
+    from . import session as sessions
+
+    for _label, targets in machines():
+        if machine not in [t.name for t in targets]:
+            continue
+        best = 0
+        for t in targets:
+            s = sessions.load(t.name)
+            if s is not None and s.alive() and s.viewers:
+                best = max(best, int(s.viewers[-1].get("web_port") or 0))
+        return best
+    return 0
+
+
 def _representative(targets: list):
     """A live session wins: connecting to a box that already has one must attach
     to THAT session rather than force a second at another contract."""
@@ -341,7 +397,10 @@ def api_machines() -> list[dict]:
             web_port = int(live.viewers[-1].get("web_port") or 0)
         out.append(
             {
-                "id": rep.name,
+                # The row answers to the MACHINE name (win0), not the
+                # representative target (pl9): rows, the active pointer and
+                # the viewport route all speak machine names.
+                "id": machine_display(targets).name,
                 "title": machine_display(targets).name,
                 "subtitle": state_text,
                 "status": status,
@@ -377,6 +436,8 @@ def _open_worker(request_id: str, target: str, quality: int, compression: int) -
         geometry=viewer.target,
         done=time.time(),
     )
+    # The sidebar just opened a machine: aim every viewport at it.
+    HUB.set_active(target, viewer.web_port)
 
 
 def _api_open(body: dict) -> tuple[dict, int]:
@@ -430,6 +491,39 @@ def _forget_old_opens() -> None:
         if e.get("done") is not None and now - e["done"] > 60.0
     ]:
         HUB.opens.pop(rid, None)
+
+
+def _api_active_post(body: dict) -> tuple[dict, int]:
+    """Aim the viewports: POST {target} from a row click or a fresh reveal."""
+    target = str(body.get("target") or "")
+    try:
+        config_mod.load_target(target)
+    except config_mod.ConfigError as exc:
+        return {"error": str(exc)}, 400
+    HUB.set_active(target, int(body.get("web_port") or 0) or None)
+    return HUB.active_payload(), 200
+
+
+def _api_state_post(body: dict) -> tuple[dict, int]:
+    """Human viewer prefs for the ACTIVE machine, from the sidebar's toggles.
+
+    Prefs ride the daemon rather than the page so they survive a viewport
+    reload and apply to whichever surface is following — two pages can never
+    disagree about what the controls say."""
+    active = HUB.active_payload()
+    if not active.get("target"):
+        return {"error": "nothing is attached"}, 400
+    target = active["target"]
+    prefs = HUB.prefs_for(target)
+    for key in ("keyboard", "scaling"):
+        if key in body:
+            prefs[key] = bool(body[key])
+    with HUB.lock:
+        HUB.prefs[target] = prefs
+        if HUB.active is not None:
+            HUB.active["prefs"] = dict(prefs)
+            HUB.active["epoch"] = HUB.active.get("epoch", 0) + 1
+    return HUB.active_payload(), 200
 
 
 def route(declared: str, live: list[str]) -> tuple[str, str]:
@@ -498,10 +592,15 @@ def _connect(session_id: str, target: str, quality: int, compression: int) -> No
         return
     HUB.push(session_id, "web-surface", "open", {
         "session": session_id,
-        "url": viewer.url,
+        # The hash aims the page at the SESSION view: an announced surface is a
+        # viewport, and a viewport shows the desktop — the controls live in the
+        # sidebar, which opens this same page without a hash.
+        "url": f"{viewer.url}#/m/{target}",
         "title": viewer.target,
     })
     HUB.probes.pop(target, None)  # the state just changed; re-probe on next read
+    # A chooser connect is a reveal like any other: aim the viewports at it.
+    HUB.set_active(target, viewer.web_port)
 
 
 # -- the control endpoint ----------------------------------------------------
@@ -569,6 +668,9 @@ def _handle(conn: socket.socket) -> None:
         if method == "GET" and path == "/api/machines":
             _respond(conn, api_machines())
             return
+        if method == "GET" and path == "/api/active":
+            _respond(conn, HUB.active_payload())
+            return
         if method == "GET" and path.startswith("/api/open/"):
             _forget_old_opens()
             rid = path.rpartition("/")[2]
@@ -588,7 +690,9 @@ def _handle(conn: socket.socket) -> None:
             HUB.seen(who)
             _respond(conn, {"events": HUB.drain(who)})
             return
-        if method != "POST" or path not in ("/action", "/api/open", "/api/screenshot"):
+        if method != "POST" or path not in (
+            "/action", "/api/open", "/api/screenshot", "/api/active", "/api/state"
+        ):
             _respond(conn, {"error": "no such route"}, 404)
             return
 
@@ -615,6 +719,14 @@ def _handle(conn: socket.socket) -> None:
 
         if path == "/api/open":
             payload, code = _api_open(body)
+            _respond(conn, payload, code)
+            return
+        if path == "/api/active":
+            payload, code = _api_active_post(body)
+            _respond(conn, payload, code)
+            return
+        if path == "/api/state":
+            payload, code = _api_state_post(body)
             _respond(conn, payload, code)
             return
         if path == "/api/screenshot":

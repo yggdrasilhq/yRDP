@@ -12,15 +12,18 @@
   principle — the geometry contract is enforced by omission, which is the only
   way it stays enforced (docs/agent-surface-attachment.md §3).
 
-  THE SHAPE (2026-09-21, the operator's directive): this is a complex sidebar
-  in the ydesign sense (hairline rows, never cards; identity marks with an
-  inset ring and a letter fallback; quiet chips; a left-rule empty state), not
-  a bare canvas. The STARTING PAGE is the startpage: the machines that are
-  connected, one row each, named after the machine. Picking a row opens the
-  session view under a glass pane (frosted, blurred, over the content) that
-  carries the human controls: screenshot, keyboard passthrough, auto-scaling.
-  The pane floats OVER the surface — it never takes space from it, and none of
-  its controls ever renegotiate the framebuffer.
+  THE SHAPE (2026-09-21, refined the same day): ONE page, TWO roles, split by
+  the hash. The SIDEBAR (this page at #/) is the remote control — a complex
+  sidebar in the ydesign sense: a glass pane on TOP carrying the human controls
+  (screenshot, keyboard passthrough, auto-scaling), and under it the machine
+  rows, named after machines. The VIEWPORT (this page at #/m/<machine>) shows
+  the desktop BARE — no bar, no pane, no chrome: vertical real estate in a
+  viewport is expensive and none of it is the sidebar's to spend. The two
+  copies talk through the daemon: a row click moves the daemon's active-machine
+  pointer, the viewport follows it, and the toggles write viewer prefs the
+  viewport applies. The daemon is the truth; both pages are thin — the
+  emacsclient model the architecture already prescribes. No control ever
+  renegotiates the framebuffer.
 
   Everything is driven by query parameters so that one file serves every target
   and the Python side owns the policy.
@@ -30,9 +33,9 @@
 <title>yRDP</title>
 <style>
   /* The yggui base token family, as inherited through ydesign's chain. The
-     startpage and pane are chrome and live on paper; the session backdrop
-     stays the operator's matte (?bg=) so an unfilled viewport reads as an
-     inset panel, not as a broken render. */
+     sidebar is chrome and lives on paper; the session backdrop stays the
+     operator's matte (?bg=) so an unfilled viewport reads as an inset panel,
+     not as a broken render. */
   :root {
     --paper: #f7f8f8;
     --ink: #24343b;
@@ -46,9 +49,9 @@
        rather than announcing itself as a different application. */
     --matte: #262a33;
     --edge: rgba(255, 255, 255, .06);
-    /* The glass: the pane treatment — a barely-there tint over real blur.
-       Frosted LIGHT, so it stays readable over both a bright desktop and the
-       dark matte, and it reads as the sidebar's own chrome, not an overlay. */
+    /* The glass: a barely-there tint over real blur. Frosted LIGHT, so it
+       stays readable over whatever sits behind it, and it reads as the
+       sidebar's own chrome, not as an overlay parked on the content. */
     --glass: rgba(252, 252, 252, .72);
     --glass-line: rgba(36, 52, 59, .12);
   }
@@ -65,20 +68,29 @@
     color: var(--ink);
   }
   body[data-view="session"] { background: var(--matte); }
+  /* The `display` set on #screen/#pane would beat the UA's [hidden] rule and
+     leave an invisible layer parked over the startpage, eating every click —
+     measured in the browser, not guessed. State beats layout explicitly. */
+  #screen[hidden], #pane[hidden] { display: none; }
 
-  /* ── The glass pane ───────────────────────────────────────────────────── */
+  /* ── The glass pane — the sidebar's top strip, the remote control ─────── */
   #pane {
     position: absolute; inset: 0 0 auto 0; z-index: 10;
-    display: flex; align-items: center; gap: 10px;
-    min-height: 46px; padding: 6px 12px;
+    display: flex; flex-direction: column; gap: 7px;
+    padding: 9px 12px 10px;
     background: var(--glass);
     -webkit-backdrop-filter: blur(16px) saturate(1.3);
     backdrop-filter: blur(16px) saturate(1.3);
     border-bottom: 1px solid var(--glass-line);
   }
+  .pane-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
   #pane .pane-title { font-weight: 600; letter-spacing: .01em; white-space: nowrap; }
-  #pane .pane-sub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #pane .spacer { flex: 1; }
+  #pane .pane-sub {
+    color: var(--muted); font-size: 12px; flex: 1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #pane .controls { display: flex; align-items: center; gap: 8px; }
+  #pane .controls .toggle { flex: 1; justify-content: space-between; }
 
   .icon-btn {
     display: inline-flex; align-items: center; justify-content: center;
@@ -87,12 +99,13 @@
     background: transparent; color: var(--ink);
     font: inherit; cursor: pointer; padding: 0;
   }
-  .icon-btn:hover { background: var(--tint); border-color: var(--accent); }
+  .icon-btn:hover:not(:disabled) { background: var(--tint); border-color: var(--accent); }
+  .icon-btn:disabled { opacity: .45; cursor: default; }
   .icon-btn svg { display: block; }
 
-  /* Toggle controls in the pane: a label plus a real switch. The switch is
-     the yggui pattern — pill, round thumb, accent when pressed — and
-     `aria-pressed` is the state, not a class name. */
+  /* Toggle controls: a label plus a real switch. The switch is the yggui
+     pattern — pill, round thumb, accent when pressed — and `aria-pressed` is
+     the state, not a class name. */
   .toggle {
     display: inline-flex; align-items: center; gap: 7px;
     height: 30px; padding: 0 10px 0 12px;
@@ -100,7 +113,8 @@
     background: transparent; color: var(--ink);
     font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap;
   }
-  .toggle:hover { border-color: var(--accent); }
+  .toggle:hover:not(:disabled) { border-color: var(--accent); }
+  .toggle:disabled { opacity: .45; cursor: default; }
   .toggle .switch {
     display: inline-flex; align-items: center;
     width: 30px; height: 17px; padding: 2px; border-radius: 999px;
@@ -123,17 +137,21 @@
   }
   .chip[data-live="1"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--paper)); }
 
-  /* ── The startpage: a complex sidebar, rows over hairlines ────────────── */
-  #page { position: absolute; inset: 0; overflow-y: auto; }
+  /* ── The sidebar's machine rows: hairlines, never cards ───────────────── */
+  #page {
+    position: absolute; inset: 0; overflow-y: auto;
+    /* The pane floats over the page; the first rows scroll beneath it. */
+    padding-top: 76px;
+  }
   .group-label {
-    padding: 18px 16px 6px;
+    padding: 12px 16px 6px;
     font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
     color: var(--muted);
   }
   .rows { border-top: 1px solid var(--line); }
   .machine-row {
-    display: grid; grid-template-columns: 32px 1fr auto; gap: 12px;
-    align-items: center; padding: 10px 16px;
+    display: grid; grid-template-columns: 32px 1fr auto auto; gap: 12px;
+    align-items: center; padding: 10px 10px 10px 16px;
     border-bottom: 1px solid var(--line);
     cursor: pointer; background: transparent; width: 100%;
     font: inherit; text-align: left; color: inherit;
@@ -142,6 +160,7 @@
   /* Rows separated by hairlines, never cards; hover is a tint, not a box. */
   .machine-row:hover { background: var(--tint); }
   .machine-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .machine-row[data-active="1"] .m-title { color: var(--accent); }
   .mark {
     width: 32px; height: 32px; border-radius: 8px;
     display: grid; place-items: center;
@@ -154,6 +173,15 @@
     color: var(--muted); font-size: 12px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  /* The open-here affordance: the sidebar is the remote control, but a copy
+     of this page with no viewport beside it still needs a way in. */
+  .open-here {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 7px;
+    border: 1px solid var(--control-line); background: transparent;
+    color: var(--muted); cursor: pointer; padding: 0; font: inherit;
+  }
+  .open-here:hover { color: var(--accent); border-color: var(--accent); background: var(--tint); }
 
   /* The empty state: a left-rule quiet block with a bolded first line and an
      escape route — kept context, not catastrophe. */
@@ -164,7 +192,7 @@
   .empty b { display: block; }
   .empty span { color: var(--muted); font-size: 12px; }
 
-  /* ── The session surface ──────────────────────────────────────────────── */
+  /* ── The session surface — the viewport's whole world, no chrome ──────── */
   /* THE GPU PATH. The canvas noVNC paints into is scaled with a CSS transform,
      which WebKit promotes to a composited layer only if we ask plainly. Without
      these the scale is redone on the CPU every frame and a 1440x1200 surface
@@ -206,11 +234,6 @@
     z-index: 5;
   }
   #status[data-show="1"] { opacity: 1; }
-
-  /* The `display` set on #screen/#pane would beat the UA's [hidden] rule and
-     leave an invisible layer parked over the startpage, eating every click —
-     measured in the browser, not guessed. State beats layout explicitly. */
-  #screen[hidden], #pane[hidden] { display: none; }
 
   /* The toast: a glass pill at the bottom, on the pane's material. */
   #toast {
@@ -259,10 +282,10 @@ const toast = (text) => {
 
 // ── The control plane ───────────────────────────────────────────────────────
 // The bridge (this origin) serves only static files and the websocket; every
-// machine-level fact — what is connected, how to start one, screenshots —
-// belongs to the daemon's control endpoint. Its URL is published beside this
-// page as control.json by the Python side, so the startpage needs no
-// parameters at all: the starting page is the startpage.
+// machine-level fact — what is connected, what the viewport should show, what
+// the toggles say — belongs to the daemon's control endpoint. Its URL is
+// published beside this page as control.json by the Python side, so the
+// sidebar needs no parameters at all: the starting page is the startpage.
 let control = q.get('control') || '';
 async function controlBase() {
   if (control) return control;
@@ -274,92 +297,38 @@ async function controlBase() {
 }
 
 // ── Router ──────────────────────────────────────────────────────────────────
-// #/           the startpage
-// #/m/<id>     one machine's session view (ws=<bridge port> pins the socket)
+// #/           the SIDEBAR: glass pane of controls + machine rows
+// #/m/<id>     the VIEWPORT: the machine's desktop, bare; it follows the
+//              daemon's active-machine pointer and its viewer prefs
 const viewParam = () => new URLSearchParams((location.hash.split('?')[1] || ''));
 const machineId = () => decodeURIComponent((location.hash.match(/^#\/m\/([^?]+)/) || [])[1] || '');
 
 let rfb = null;
 let retry = 0;
 let settled = false;
+let tickTimer = 0;
+let slowTick = 0;
 const say = (text, show) => { statusEl.textContent = text; statusEl.dataset.show = show ? '1' : '0'; };
 
-// Human controls, pane-scoped state. Defaults follow the contract: scaled to
-// fit, keyboard live. Neither ever resizes the far end — the toggles change
-// only THIS window's relationship to a framebuffer nobody renegotiates.
-const controls = { keyboard: true, scaling: true };
+function stopTicks() { clearInterval(tickTimer); clearInterval(slowTick); tickTimer = slowTick = 0; }
 
 const ICONS = {
-  back: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5 4.5 7 9 11.5"/></svg>',
   camera: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4.5h2l1-1.5h5l1 1.5h2v7h-11z"/><circle cx="7" cy="7.8" r="2.2"/></svg>',
   refresh: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7a5 5 0 1 1-1.5-3.6M12 1.5V4h-2.5"/></svg>',
+  open: '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 2h-2v8h8V8"/><path d="M7 2h3v3M10 2 5.5 6.5"/></svg>',
 };
 
-function renderPane({ title, sub, back, right = [] } = {}) {
-  paneEl.hidden = false;
-  paneEl.textContent = '';
-  if (back) {
-    const b = document.createElement('button');
-    b.className = 'icon-btn'; b.title = 'Back to startpage'; b.innerHTML = ICONS.back;
-    b.addEventListener('click', () => { location.hash = '#/'; });
-    paneEl.appendChild(b);
-  }
-  const t = document.createElement('div');
-  t.style.cssText = 'display:flex;align-items:baseline;gap:8px;min-width:0;overflow:hidden;';
-  const titleEl = document.createElement('span');
-  titleEl.className = 'pane-title'; titleEl.textContent = title;
-  t.appendChild(titleEl);
-  if (sub) {
-    const subEl = document.createElement('span');
-    subEl.className = 'pane-sub'; subEl.textContent = sub;
-    t.appendChild(subEl);
-  }
-  paneEl.appendChild(t);
-  paneEl.appendChild(Object.assign(document.createElement('div'), { className: 'spacer' }));
-  for (const el of right) paneEl.appendChild(el);
-}
-
-function toggleButton(label, key, onChange) {
-  const b = document.createElement('button');
-  b.className = 'toggle';
-  b.setAttribute('aria-pressed', String(controls[key]));
-  const span = document.createElement('span'); span.textContent = label;
-  const sw = document.createElement('span'); sw.className = 'switch';
-  const th = document.createElement('span'); th.className = 'thumb';
-  sw.appendChild(th); b.appendChild(span); b.appendChild(sw);
-  b.addEventListener('click', () => {
-    controls[key] = !controls[key];
-    b.setAttribute('aria-pressed', String(controls[key]));
-    onChange(controls[key]);
+async function post(path, body) {
+  const base = await controlBase();
+  if (!base) throw new Error('no control endpoint');
+  const r = await fetch(base + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
   });
-  return b;
+  return { ok: r.ok, body: await r.json().catch(() => ({})) };
 }
 
-function shootButton(target) {
-  const b = document.createElement('button');
-  b.className = 'icon-btn'; b.title = 'Screenshot (downloads a PNG)'; b.innerHTML = ICONS.camera;
-  b.addEventListener('click', async () => {
-    const base = await controlBase();
-    if (!base) { toast('no control endpoint — cannot screenshot'); return; }
-    try {
-      const r = await fetch(base + '/api/screenshot', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target }),
-      });
-      if (!r.ok) { toast((await r.json().catch(() => ({}))).error || 'screenshot failed'); return; }
-      const blob = await r.blob();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `yrdp-${target}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      toast('screenshot saved');
-    } catch (e) { toast('screenshot failed: ' + e.message); }
-  });
-  return b;
-}
-
-// ── The session view ────────────────────────────────────────────────────────
+// ── Shared session plumbing (the viewport's engine) ─────────────────────────
 function destroyRfb() {
   if (rfb) { try { rfb.disconnect(); } catch (_) {} rfb = null; }
 }
@@ -373,43 +342,40 @@ function applyScaling(on) {
   }));
 }
 
-function openSession(id, wsPort) {
+function connectRfb(wsPort) {
   destroyRfb();
   settled = false; retry = 0;
-  // The bridge port comes from the row (the daemon knows where each session's
-  // exporter is), never guessed from this page's own origin: the page can
-  // outlive the bridge that first served it.
+  // The bridge port comes from the daemon's active pointer (or the deep link
+  // that announced this surface), never guessed from this page's own origin:
+  // the page can outlive the bridge that first served it.
   const wsBase = wsPort
     ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:${wsPort}`
     : location.origin;
-  const wsUrl = wsBase + '/websockify';
 
-  rfb = new RFB(screenEl, wsUrl, {});
+  rfb = new RFB(screenEl, wsBase + '/websockify', {});
 
   // ── The geometry contract, in three lines ────────────────────────────────
   // scaleViewport: the viewer scales itself to whatever window it is given
-  //   (auto-scaling, the operator's default; the pane toggle trades it for 1:1
-  //   pixels). resizeSession: NEVER — a viewer that renegotiates the surface
-  //   has silently converted --scaled into --adopt and invalidated the agent's
-  //   coordinates. clipViewport: off, or a surface larger than the window
-  //   would scroll instead of scaling.
-  rfb.scaleViewport = controls.scaling;
+  //   (auto-scaling, the operator's default; the sidebar's toggle trades it
+  //   for 1:1 pixels). resizeSession: NEVER — a viewer that renegotiates the
+  //   surface has silently converted --scaled into --adopt and invalidated
+  //   the agent's coordinates. clipViewport: off, or a surface larger than
+  //   the window would scroll instead of scaling.
+  rfb.scaleViewport = viewer.scaling;
   rfb.resizeSession = false;
   rfb.clipViewport = false;
 
   rfb.qualityLevel = num('quality', 9);
   rfb.compressionLevel = num('compression', 0);
   rfb.showDotCursor = q.get('dot') !== '0';
-  rfb.viewOnly = !controls.keyboard;
+  rfb.viewOnly = !viewer.keyboard;
   rfb.background = 'transparent';
   rfb.focusOnClick = true;
 
   rfb.addEventListener('connect', () => {
     settled = true; retry = 0;
     say('', false);
-    // Keyboard input goes to whichever element has focus; take it back from
-    // the pane controls as soon as there is something to type into.
-    if (controls.keyboard) rfb.focus();
+    if (viewer.keyboard) rfb.focus();
   });
 
   rfb.addEventListener('disconnect', (e) => {
@@ -420,7 +386,7 @@ function openSession(id, wsPort) {
     retry = Math.min(retry + 1, 10);
     const wait = Math.min(250 * retry, 2000);
     say(clean && settled ? 'reconnecting…' : 'connecting…', true);
-    setTimeout(() => { if (machineId() === id) openSession(id, wsPort); }, wait);
+    setTimeout(() => { if (machineId() === viewing) connectRfb(viewer.ws); }, wait);
   });
 
   // A console with no auth still fires this if a target ever grows one; answering
@@ -430,38 +396,160 @@ function openSession(id, wsPort) {
   say('connecting…', true);
 }
 
-function renderSession(id, wsPort) {
+// The viewport's local mirror of the daemon's active pointer. Server truth,
+// applied locally: the sidebar writes, the daemon arbitrates, we follow.
+const viewer = { keyboard: true, scaling: true, ws: 0 };
+let viewing = '';
+
+async function renderViewport(id, wsParam) {
   document.body.dataset.view = 'session';
+  paneEl.hidden = true;
   pageEl.hidden = true;
   screenEl.hidden = false;
+  viewing = id;
+  viewer.ws = Number(wsParam) || 0;
 
-  renderPane({
-    title: id,
-    back: true,
-    right: [
-      shootButton(id),
-      toggleButton('Keyboard', 'keyboard', (on) => {
-        if (!rfb) return;
-        rfb.viewOnly = !on;
-        if (on) { try { rfb.focus(); } catch (_) {} }
-        toast(on ? 'keyboard passes through to the machine' : 'keyboard stays local (view only)');
-      }),
-      toggleButton('Scaling', 'scaling', (on) => {
-        applyScaling(on);
-        toast(on ? 'auto-scaling: the surface fits the sidebar' : 'auto-scaling off: 1:1 pixels');
-      }),
-    ],
-  });
-  openSession(id, wsPort);
+  // Announce ourselves as the active machine — a fresh reveal wins, the same
+  // input-switching rule a row click follows — and pick up the machine's
+  // stored prefs plus its canonical machine id in one round trip.
+  try {
+    const { ok, body } = await post('/api/active', { target: id, web_port: viewer.ws });
+    if (ok && body.target) {
+      if (body.target !== id) {
+        // The daemon normalises app targets (pl9) to their machine (win0);
+        // follow the canonical name so the follow-loop compares apples.
+        location.replace(`#/m/${body.target}?ws=${body.web_port || viewer.ws || ''}`);
+        return;
+      }
+      if (body.web_port && !viewer.ws) viewer.ws = body.web_port;
+      viewer.keyboard = body.prefs ? body.prefs.keyboard !== false : true;
+      viewer.scaling = body.prefs ? body.prefs.scaling !== false : true;
+    }
+  } catch (_) { /* no daemon: the deep link's own ws still works */ }
+
+  connectRfb(viewer.ws);
+
+  // Follow the pointer: a row click elsewhere re-aims this viewport, a
+  // re-attach moves us to the new bridge, a pref flip applies in place.
+  stopTicks();
+  tickTimer = setInterval(async () => {
+    const base = await controlBase();
+    if (!base) return;
+    try {
+      const a = await (await fetch(base + '/api/active')).json();
+      if (!a.target) return;
+      if (a.target !== viewing) {
+        location.replace(`#/m/${a.target}${a.web_port ? '?ws=' + a.web_port : ''}`);
+        return;
+      }
+      if (a.web_port && viewer.ws && a.web_port !== viewer.ws) {
+        viewer.ws = a.web_port;
+        connectRfb(viewer.ws);
+        return;
+      }
+      if (a.web_port && !viewer.ws) { viewer.ws = a.web_port; connectRfb(viewer.ws); return; }
+      const kb = a.prefs ? a.prefs.keyboard !== false : true;
+      const sc = a.prefs ? a.prefs.scaling !== false : true;
+      if (kb !== viewer.keyboard) {
+        viewer.keyboard = kb;
+        if (rfb) { rfb.viewOnly = !kb; if (kb) { try { rfb.focus(); } catch (_) {} } }
+      }
+      if (sc !== viewer.scaling) { viewer.scaling = sc; applyScaling(sc); }
+    } catch (_) { /* the daemon blinks; keep showing what we have */ }
+  }, 1000);
 }
 
-// ── The startpage ───────────────────────────────────────────────────────────
+// ── The sidebar: the remote control ─────────────────────────────────────────
 let machinesCache = [];
+let activeCache = { target: null, epoch: 0, prefs: {} };
+let machinesJson = '[]';
+let rowsDirty = true;
+
+function toggleControl(label, key) {
+  const b = document.createElement('button');
+  b.className = 'toggle'; b.dataset.pref = key;
+  const span = document.createElement('span'); span.textContent = label;
+  const sw = document.createElement('span'); sw.className = 'switch';
+  const th = document.createElement('span'); th.className = 'thumb';
+  sw.appendChild(th); b.appendChild(span); b.appendChild(sw);
+  b.addEventListener('click', async () => {
+    if (!activeCache.target) return;
+    const next = !(activeCache.prefs ? activeCache.prefs[key] !== false : true);
+    b.setAttribute('aria-pressed', String(next)); // optimistic; the poll confirms
+    try {
+      const { ok, body } = await post('/api/state', { [key]: next });
+      if (ok && body.target) { activeCache = body; drawPaneControls(); }
+    } catch (e) { toast('the daemon refused that: ' + e.message); }
+  });
+  return b;
+}
+
+let shootBtn, kbToggle, scToggle;
+
+function drawPane() {
+  paneEl.hidden = false;
+  paneEl.textContent = '';
+  const row1 = document.createElement('div'); row1.className = 'pane-row';
+  const t = document.createElement('span');
+  t.className = 'pane-title';
+  t.textContent = activeCache.target || 'yRDP';
+  row1.appendChild(t);
+  const sub = document.createElement('span');
+  sub.className = 'pane-sub';
+  sub.textContent = activeCache.target
+    ? 'attached — the viewport follows this machine'
+    : `${machinesCache.filter((m) => m.live).length} of ${machinesCache.length} connected`;
+  row1.appendChild(sub);
+  const refresh = document.createElement('button');
+  refresh.className = 'icon-btn'; refresh.title = 'Refresh'; refresh.innerHTML = ICONS.refresh;
+  refresh.addEventListener('click', refreshAll);
+  row1.appendChild(refresh);
+  paneEl.appendChild(row1);
+
+  const row2 = document.createElement('div'); row2.className = 'pane-row controls';
+  shootBtn = document.createElement('button');
+  shootBtn.className = 'icon-btn'; shootBtn.title = 'Screenshot (downloads a PNG)';
+  shootBtn.innerHTML = ICONS.camera;
+  shootBtn.addEventListener('click', shoot);
+  kbToggle = toggleControl('Keyboard', 'keyboard');
+  scToggle = toggleControl('Scaling', 'scaling');
+  row2.appendChild(shootBtn); row2.appendChild(kbToggle); row2.appendChild(scToggle);
+  paneEl.appendChild(row2);
+  drawPaneControls();
+}
+
+function drawPaneControls() {
+  const on = !!activeCache.target;
+  shootBtn.disabled = !on; kbToggle.disabled = !on; scToggle.disabled = !on;
+  const p = activeCache.prefs || {};
+  kbToggle.setAttribute('aria-pressed', String(p.keyboard !== false));
+  scToggle.setAttribute('aria-pressed', String(p.scaling !== false));
+}
+
+async function shoot() {
+  if (!activeCache.target) { toast('nothing is attached'); return; }
+  try {
+    const base = await controlBase();
+    const r = await fetch(base + '/api/screenshot', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: activeCache.target }),
+    });
+    if (!r.ok) { toast((await r.json().catch(() => ({}))).error || 'screenshot failed'); return; }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `yrdp-${activeCache.target}-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast('screenshot saved');
+  } catch (e) { toast('screenshot failed: ' + e.message); }
+}
 
 function row(m, connected) {
   const b = document.createElement('button');
   b.className = 'machine-row';
   b.type = 'button';
+  if (activeCache.target === m.id) b.dataset.active = '1';
   const mark = document.createElement('span');
   mark.className = 'mark';
   mark.textContent = (m.title || m.id || '?').trim().charAt(0).toUpperCase() || '?';
@@ -474,6 +562,18 @@ function row(m, connected) {
   chip.textContent = connected ? 'live' : (m.protocol || '').toUpperCase() || 'open';
   if (connected) chip.dataset.live = '1';
   b.appendChild(mark); b.appendChild(mid); b.appendChild(chip);
+  // The row is the remote control: it aims the viewport. The chevron is the
+  // one way in for a copy of this page that has no viewport beside it.
+  if (connected && m.web_port) {
+    const open = document.createElement('span');
+    open.className = 'open-here'; open.title = 'Open this desktop here';
+    open.innerHTML = ICONS.open;
+    open.addEventListener('click', (e) => {
+      e.stopPropagation();
+      location.hash = `#/m/${encodeURIComponent(m.id)}?ws=${m.web_port}`;
+    });
+    b.appendChild(open);
+  }
   b.addEventListener('click', () => pick(m));
   return b;
 }
@@ -494,28 +594,28 @@ function groupLabel(text) {
 }
 
 async function pick(m) {
-  if (m.live && m.web_port) {
-    location.hash = `#/m/${encodeURIComponent(m.id)}?ws=${m.web_port}`;
+  if (m.live) {
+    // Aim the viewport; the sidebar stays a sidebar.
+    try {
+      const { ok, body } = await post('/api/active', { target: m.id });
+      if (ok && body.target) {
+        activeCache = body;
+        drawPane(); // the title names the machine now attached
+        refresh();
+      }
+    } catch (e) { toast('the daemon refused that: ' + e.message); }
     return;
   }
-  const base = await controlBase();
-  if (!base) { toast('no control endpoint — run `yrdp pick` or `yrdp view` beside the daemon'); return; }
-  toast('connecting to ' + m.title + '…');
   try {
-    const r = await fetch(base + '/api/open', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target: m.id }),
-    });
-    const { request, error } = await r.json();
-    if (error || !request) { toast(error || 'the daemon refused the connect'); return; }
+    const { body } = await post('/api/open', { target: m.id });
+    if (body.error || !body.request) { toast(body.error || 'the daemon refused the connect'); return; }
+    toast('connecting to ' + m.title + '…');
     const deadline = Date.now() + 65000;
     const poll = async () => {
-      const w = await fetch(base + '/api/open/' + encodeURIComponent(request));
+      const base = await controlBase();
+      const w = await fetch(base + '/api/open/' + encodeURIComponent(body.request));
       const st = await w.json();
-      if (st.status === 'ready') {
-        location.hash = `#/m/${encodeURIComponent(m.id)}?ws=${st.web_port}`;
-        return;
-      }
+      if (st.status === 'ready') { refresh(); toast(m.title + ' is up — the viewport is on it'); return; }
       if (st.status === 'failed') { toast('connect failed — ' + st.error); refresh(); return; }
       if (Date.now() > deadline) { toast('still connecting — the row will show state'); refresh(); return; }
       setTimeout(poll, 800);
@@ -524,25 +624,18 @@ async function pick(m) {
   } catch (e) { toast('connect failed: ' + e.message); }
 }
 
-function renderStart(machines, hasControl) {
+function renderSidebar() {
   document.body.dataset.view = 'start';
   screenEl.hidden = true; statusEl.dataset.show = '0';
   pageEl.hidden = false;
+  drawPane();
+  drawRows();
+}
+
+function drawRows() {
   pageEl.textContent = '';
-
-  renderPane({
-    title: 'yRDP',
-    sub: `${machines.filter((m) => m.live).length} of ${machines.length} connected`,
-    right: (() => {
-      const b = document.createElement('button');
-      b.className = 'icon-btn'; b.title = 'Refresh'; b.innerHTML = ICONS.refresh;
-      b.addEventListener('click', refresh);
-      return [b];
-    })(),
-  });
-
-  const live = machines.filter((m) => m.live);
-  const rest = machines.filter((m) => !m.live);
+  const live = machinesCache.filter((m) => m.live);
+  const rest = machinesCache.filter((m) => !m.live);
   if (live.length) {
     pageEl.appendChild(groupLabel('Connected'));
     const wrap = document.createElement('div'); wrap.className = 'rows';
@@ -555,7 +648,8 @@ function renderStart(machines, hasControl) {
     rest.forEach((m) => wrap.appendChild(row(m, false)));
     pageEl.appendChild(wrap);
   }
-  if (!machines.length) {
+  if (!machinesCache.length) {
+    const hasControl = !!control;
     pageEl.appendChild(emptyState(
       hasControl ? 'No machines yet.' : 'No control endpoint.',
       hasControl
@@ -565,32 +659,90 @@ function renderStart(machines, hasControl) {
   }
 }
 
-async function refresh() {
+async function refreshAll() {
   const base = await controlBase();
-  if (!base) { renderStart(machinesCache, false); return; }
-  try {
-    const r = await fetch(base + '/api/machines');
-    if (!r.ok) throw new Error('http ' + r.status);
-    machinesCache = await r.json();
-  } catch (_) { /* keep the last good list */ }
-  renderStart(machinesCache, true);
+  if (base) {
+    try {
+      const [m, a] = await Promise.all([
+        fetch(base + '/api/machines'),
+        fetch(base + '/api/active'),
+      ]);
+      if (m.ok) {
+        const next = await m.json();
+        // Rebuild the rows only when a row actually changed: a wholesale
+        // redraw every poll replaces the DOM under the user's cursor — hover
+        // dies, and a click that resolved one build lands on the next.
+        const nextJson = JSON.stringify(next);
+        if (nextJson !== machinesJson) { machinesCache = next; machinesJson = nextJson; rowsDirty = true; }
+      }
+      if (a.ok) {
+        const next = await a.json();
+        if ((next.epoch || 0) !== (activeCache.epoch || 0) || next.target !== activeCache.target) {
+          activeCache = next;
+          drawPane();
+          rowsDirty = true; // the active highlight lives on the rows
+        } else {
+          activeCache = next;
+          drawPaneControls();
+          if (!next.target) drawPane();
+        }
+      }
+    } catch (_) { /* keep the last good lists */ }
+  }
+  if (rowsDirty) { drawRows(); rowsDirty = false; }
 }
 
 let pollTimer = 0;
 function route() {
-  clearTimeout(pollTimer);
+  stopTicks(); clearTimeout(pollTimer);
   const id = machineId();
   if (id) {
-    renderSession(id, viewParam().get('ws'));
+    renderViewport(id, viewParam().get('ws'));
     return;
   }
   destroyRfb();
-  renderStart(machinesCache, !!control);
-  refresh();
-  pollTimer = setTimeout(function again() { refresh(); pollTimer = setTimeout(again, 5000); }, 5000);
+  renderSidebar();
+  refreshAll();
+  // The sidebar polls cheaply: the active pointer every second (so a toggle
+  // lands within a breath), the machine list every five.
+  let n = 0;
+  pollTimer = setInterval(async () => {
+    n += 1;
+    const base = await controlBase();
+    if (!base) return;
+    let changed = false;
+    try {
+      const a = await fetch(base + '/api/active');
+      if (a.ok) {
+        const next = await a.json();
+        if ((next.epoch || 0) !== (activeCache.epoch || 0) || next.target !== activeCache.target) {
+          activeCache = next;
+          changed = true;
+        } else {
+          activeCache = next;
+          drawPaneControls();
+          // The count under the title reads the machine list; keep it honest
+          // as rows come and go, even while nothing is attached.
+          if (!next.target) drawPane();
+        }
+      }
+    } catch (_) {}
+    if (changed) { drawPane(); drawRows(); }
+    else if (n % 5 === 0) refreshAll();
+  }, 1000);
 }
 window.addEventListener('hashchange', route);
 route();
+
+// A window onto the page's state — for the console when something looks
+// wrong, and for tests that need to see inside the module.
+window.__yrdp = {
+  get viewer() { return viewer; },
+  get viewing() { return viewing; },
+  get rfb() { return rfb; },
+  get active() { return activeCache; },
+  get machines() { return machinesCache; },
+};
 
 // ── Rescale when the VIEWPORT changes, not just when the window does ────────
 // noVNC observes the container itself, but `_handleResize` early-returns when
@@ -599,7 +751,7 @@ route();
 // which can deliver the observation before layout has settled. The surface then
 // keeps its old scale and the new space becomes matte: exactly the "I hid my
 // cwd tree and got extra black bar padding" report.
-const rescale = () => { if (rfb) applyScaling(controls.scaling); };
+const rescale = () => { if (rfb) applyScaling(viewer.scaling); };
 new ResizeObserver(rescale).observe(document.getElementById('screen'));
 window.addEventListener('resize', rescale);
 // A surface the host hid and re-showed can come back at a different size while
@@ -609,6 +761,6 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) resc
 // Refocus on click even after the surface has been backgrounded and rehidden by
 // the host — the webview keeps the DOM but not always the focus ring.
 window.addEventListener('mousedown', (e) => {
-  if (rfb && controls.keyboard && !paneEl.contains(e.target)) { try { rfb.focus(); } catch (_) {} }
+  if (rfb && viewer.keyboard && !paneEl.contains(e.target)) { try { rfb.focus(); } catch (_) {} }
 });
 </script>

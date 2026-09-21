@@ -342,7 +342,9 @@ def attach(
 
     emit("open", {
         "session": os.environ.get("YGGTERM_SESSION_ID", ""),
-        "url": url,
+        # The hash aims the page at the SESSION view — a viewport shows the
+        # desktop bare; the controls live in the sidebar's copy of this page.
+        "url": f"{url}#/m/{s.target if s else label}",
         "title": title or (f"{s.target} ({s.geometry})" if s else label),
     })
     return viewer
