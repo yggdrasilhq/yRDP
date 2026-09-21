@@ -68,6 +68,12 @@ IDLE_EXIT_SECONDS = 3600.0
 #: hopeful: a mailbox is addressed to a session we heard from seconds ago.
 CLIENT_TTL = 12.0
 
+#: How long a chooser keeps its VOTE on where a desktop opens.  Choosers leak:
+#: a pick left in a forgotten row polls for many hours and every one of those
+#: hours it vetoes every other chooser's connect.  Past this age a chooser is
+#: still served (rows stay fresh) but no longer counts as a routing candidate.
+CHOOSER_MAX_AGE = 2 * 3600.0
+
 
 class _Hub:
     """Everything that is worth not rebuilding: probe state and the OSC queue."""
@@ -86,6 +92,9 @@ class _Hub:
         # Which client sessions are actually listening, by last `/events` poll.
         # A mailbox addressed to anything else is a message into the void.
         self.clients: dict[str, float] = {}
+        # When each client FIRST polled — the chooser's age. Ages decide the
+        # vote: see CHOOSER_MAX_AGE and live_clients().
+        self.client_since: dict[str, float] = {}
         # The last connect failure per target, so a failure is something the
         # operator READS rather than something the pane hides.
         self.errors: dict[str, str] = {}
@@ -134,13 +143,46 @@ class _Hub:
     def seen(self, session: str) -> None:
         """Record that a client is listening. Every poll is its own liveness."""
         if session:
+            now = time.monotonic()
             with self.lock:
-                self.clients[session] = time.monotonic()
+                self.client_since.setdefault(session, now)
+                self.clients[session] = now
 
     def live_clients(self) -> list[str]:
+        """The choosers a connect may be routed to: fresh polls, AND young.
+
+        Age matters because choosers leak: `yrdp pick` runs until its session
+        dies, and a pane forgotten in some old row keeps polling for hours —
+        measured today at nineteen — silently vetoing every OTHER chooser's
+        connect. A chooser is a transient UI; past CHOOSER_MAX_AGE it can keep
+        looking, but it no longer votes on where a desktop opens.
+        """
         now = time.monotonic()
         with self.lock:
-            return sorted(s for s, at in self.clients.items() if now - at <= CLIENT_TTL)
+            return sorted(
+                s for s, at in self.clients.items()
+                if now - at <= CLIENT_TTL
+                and now - self.client_since.get(s, now) <= CHOOSER_MAX_AGE
+            )
+
+    def aged_clients(self) -> list[tuple[str, float]]:
+        """Polling choosers that have aged past their vote, oldest first, with
+        their ages in seconds — so a refusal can name what is blocking."""
+        now = time.monotonic()
+        with self.lock:
+            return sorted(
+                ((s, now - since) for s, since in self.client_since.items()
+                 if s in self.clients
+                 and now - self.clients[s] <= CLIENT_TTL
+                 and now - since > CHOOSER_MAX_AGE),
+                key=lambda pair: pair[1], reverse=True,
+            )
+
+    def ages(self, sids: list[str]) -> list[float]:
+        """How long each named client has been open, in seconds."""
+        now = time.monotonic()
+        with self.lock:
+            return [now - self.client_since.get(s, now) for s in sids]
 
     def push(self, session: str, verb: str, action: str, payload: dict) -> None:
         with self.lock:
@@ -165,6 +207,12 @@ class _Hub:
                 if now - self.clients.get(s, 0.0) > CLIENT_TTL
             ]:
                 self.events.pop(sess, None)
+            for sess in [
+                s for s in self.client_since
+                if now - self.clients.get(s, 0.0) > CLIENT_TTL
+            ]:
+                self.client_since.pop(sess, None)
+                self.clients.pop(sess, None)
 
 
 HUB = _Hub()
@@ -557,15 +605,35 @@ def route(declared: str, live: list[str]) -> tuple[str, str]:
     if len(live) == 1:
         return live[0], ""
     if not live:
+        aged = HUB.aged_clients()
+        if aged:
+            # Choosers ARE listening — but they have all aged past their vote.
+            # Say so plainly instead of pretending nobody is there.
+            return "", (
+                f"{len(aged)} chooser(s) have been open for many hours and no "
+                f"longer decide where a desktop opens. Reopen one freshly: run "
+                f"yrdp pick in a yggterm session and connect again."
+            )
         return "", (
             "No chooser is listening any more, so there is nowhere to put this "
             "desktop. Run yrdp pick in a yggterm session and connect again."
         )
-    return "", (
-        f"{len(live)} choosers are open and the click did not say which one "
-        f"asked, so this desktop has no address. Close the others, or open one "
-        f"directly with yrdp view --target <name>."
+    ages = ", ".join(
+        f"one open {_age_text(age)}" for age in HUB.ages(live)
     )
+    detail = f" ({ages})" if ages else ""
+    return "", (
+        f"{len(live)} choosers are open{detail} and the click did not say which "
+        f"one asked, so this desktop has no address. Close the stale one — the "
+        f"oldest is the one you forgot — or open one directly with "
+        f"yrdp view --target <name>."
+    )
+
+
+def _age_text(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 60:.0f}m"
 
 
 def _connect(session_id: str, target: str, quality: int, compression: int) -> None:

@@ -816,3 +816,59 @@ def test_the_daemon_knows_the_chooser_before_the_operator_can_click_it(monkeypat
         "the chooser was on screen and clickable before the daemon had any way "
         "to know who to answer"
     )
+
+
+# -- chooser routing: the age cap --------------------------------------------
+#
+# Choosers leak: `yrdp pick` runs until its session dies, and a pane forgotten
+# in an old row polls for many hours — measured at nineteen — while every one
+# of those hours it vetoes every OTHER chooser's connect. Past the age cap a
+# chooser keeps looking but stops voting.
+
+
+def _seed_hub(monkeypatch, now):
+    from yrdp import daemon
+    hub = daemon._Hub()
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: now)
+    # route() reads the module-global HUB; the tests install their own so the
+    # global's accumulated state can never leak into an assertion.
+    monkeypatch.setattr(daemon, "HUB", hub)
+    return daemon, hub
+
+
+def test_fresh_chooser_lone_gets_the_vote(monkeypatch):
+    daemon, hub = _seed_hub(monkeypatch, 10_000.0)
+    hub.seen("s1")
+    assert hub.live_clients() == ["s1"]
+
+
+def test_aged_chooser_loses_the_vote_but_keeps_looking(monkeypatch):
+    daemon, hub = _seed_hub(monkeypatch, 10_000.0)
+    hub.seen("zombie")
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: 10_000.0 + 3 * 3600)
+    hub.seen("zombie")  # still polling, still served
+    assert hub.live_clients() == []              # no vote
+    assert hub.aged_clients()[0][0] == "zombie"  # but named in refusals
+
+
+def test_fresh_chooser_outvotes_an_aged_zombie(monkeypatch):
+    daemon, hub = _seed_hub(monkeypatch, 10_000.0)
+    hub.seen("zombie")
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: 10_000.0 + 3 * 3600)
+    hub.seen("zombie")
+    hub.seen("fresh")
+    assert hub.live_clients() == ["fresh"]
+
+
+def test_two_fresh_choosers_still_refuse_with_ages(monkeypatch):
+    daemon, hub = _seed_hub(monkeypatch, 10_000.0)
+    hub.seen("a")
+    import time as time_mod
+    monkeypatch.setattr(time_mod, "monotonic", lambda: 10_000.0 + 120)
+    import yrdp.daemon as d
+    monkeypatch.setattr(d.time, "monotonic", lambda: 10_000.0 + 120)
+    hub.seen("a")  # a is 2m old but still polling, so still live
+    hub.seen("b")
+    refusal = daemon.route("", hub.live_clients())[1]
+    assert "2 choosers are open" in refusal
+    assert "0h" in refusal or "2m" in refusal  # ages are named
