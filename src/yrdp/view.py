@@ -39,6 +39,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -287,7 +288,8 @@ def attach(
         vnc = subprocess.Popen(
             argv, env=_clean_env(s.display), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
-        _await_port(vnc_port, vnc, "x11vnc")
+        vnc_tail = _StderrTail(vnc)
+        _await_port(vnc_port, vnc, "x11vnc", tail=vnc_tail)
         pids.append(vnc.pid)
 
     bridge = subprocess.Popen(
@@ -295,6 +297,7 @@ def attach(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
+    bridge_tail = _StderrTail(bridge)
     try:
         # 45 s, not 15.  The FIRST websockify on a host has to import its
         # dependencies and stand up a `multiprocessing` forkserver before it
@@ -304,7 +307,7 @@ def attach(
         # listened on 6100") that `ss` contradicted a second later, leaving a
         # COMPLETE working bridge with nothing announcing it.  Warm caches make
         # the retry instant, so this only ever bit the first view after a boot.
-        _await_port(web_port, bridge, "websockify", timeout=45.0)
+        _await_port(web_port, bridge, "websockify", timeout=45.0, tail=bridge_tail)
     except ViewError:
         # Whatever we started before failing is ours to clean up.  Without this,
         # a failed attach leaks the x11vnc it had already spawned; the next
@@ -380,11 +383,48 @@ def _reap_pids(pids: list[int]) -> None:
             pass
 
 
-def _await_port(port: int, proc: subprocess.Popen, what: str, timeout: float = 15.0) -> None:
+class _StderrTail:
+    """Drain a child's stderr so its pipe can never fill and freeze it.
+
+    Measured 2026-09-27 on jojo: x11vnc spawned with `stderr=PIPE` and no
+    reader logged steadily until the 64 KB pipe buffer filled, then blocked
+    for ever in `anon_pipe_write` — the process LISTENED but never completed
+    its RFB handshake, and noVNC sat on "connecting…" over a healthy desktop.
+    Every spawned exporter was a slow fuse; busy displays just lit it faster.
+    Keep the LAST `keep` bytes for `_await_port`'s failure report instead of
+    the first 64 KB the pipe happened to hold.
+    """
+
+    def __init__(self, proc: subprocess.Popen, keep: int = 8192) -> None:
+        self._proc = proc
+        self._keep = keep
+        self.tail = bytearray()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        stream = self._proc.stderr
+        while True:
+            chunk = stream.read(4096)  # blocks; b"" only at EOF
+            if not chunk:
+                return
+            self.tail = (self.tail + chunk)[-self._keep:]
+
+    def text(self) -> str:
+        # A caller arriving at process death still races the drain thread's
+        # final read; wait briefly for EOF so the tail is the whole story.
+        self._thread.join(timeout=2.0)
+        # The END is the failure; head-trimming here would report the oldest
+        # log lines and hide exactly the error the tail exists to keep.
+        return self.tail.decode(errors="replace").strip()[-300:]
+
+
+def _await_port(port: int, proc: subprocess.Popen, what: str, timeout: float = 15.0,
+                tail: "_StderrTail | None" = None) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            err = (proc.stderr.read() or b"").decode(errors="replace").strip()[:300]
+            err = tail.text() if tail else (proc.stderr.read() or b"").decode(errors="replace").strip()[:300]
             raise ViewError(f"{what} exited before it listened on {port}: {err}")
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):

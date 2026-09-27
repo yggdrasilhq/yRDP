@@ -872,3 +872,41 @@ def test_two_fresh_choosers_still_refuse_with_ages(monkeypatch):
     refusal = daemon.route("", hub.live_clients())[1]
     assert "2 choosers are open" in refusal
     assert "0h" in refusal or "2m" in refusal  # ages are named
+
+
+def test_stderr_tail_keeps_a_chatty_child_unblocked() -> None:
+    """The x11vnc freeze of 2026-09-27: spawned with stderr=PIPE and no reader,
+    x11vnc logged until the 64 KB pipe buffer filled, then blocked for ever in
+    anon_pipe_write — listening but never serving RFB, and noVNC sat on
+    "connecting…" over a healthy desktop. The tail must drain the pipe
+    continuously and keep the LAST bytes for the failure report."""
+    import subprocess
+    import time
+
+    from yrdp.view import _StderrTail
+
+    child = (
+        "import sys, time\n"
+        "for i in range(200):\n"
+        "    print(f'x11vnc log line {i:04d} ' + 'x' * 96, file=sys.stderr, flush=True)\n"
+        "    time.sleep(0.005)\n"
+        "print('FINAL-EXIT-MARKER', file=sys.stderr)\n"
+    )
+    proc = subprocess.Popen(
+        ["python3", "-c", child],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    tail = _StderrTail(proc)
+
+    # An undrained pipe wedges the writer part-way (blocked in write on a full
+    # buffer) — the child would still be alive with most of its log unsent.
+    # Drained, it runs to completion well inside this budget.
+    deadline = time.monotonic() + 10.0
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert proc.poll() == 0, "the child blocked on its own stderr pipe — the freeze is back"
+
+    text = tail.text()
+    assert "FINAL-EXIT-MARKER" in text, "the tail lost the last bytes it exists to keep"
+    assert "x11vnc log line 0000" not in text, "the tail keeps the LAST bytes, not all of them"
